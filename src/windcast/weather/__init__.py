@@ -35,6 +35,7 @@ __all__ = [
     "WeatherStorage",
     "WeightedWeatherConfig",
     "get_forecast_weather",
+    "get_live_forecast",
     "get_weather",
     "get_weather_config",
     "get_weather_weighted",
@@ -241,6 +242,70 @@ def get_forecast_weather(
         end_date=end_date,
         db_path=db_path,
         provider=provider,
+    )
+
+
+def get_live_forecast(
+    config_name: str,
+    forecast_days: int = 7,
+    past_days: int = 0,
+) -> pl.DataFrame:
+    """Fetch live NWP forecast for a registered weather config.
+
+    Uses the Open-Meteo Forecast API (latest model run). No SQLite caching —
+    live forecasts are ephemeral by nature (updated every ~6h). HTTP-level
+    caching uses a 1h TTL via ``requests_cache``.
+
+    Supports both single-point (:class:`WeatherConfig`) and multi-point
+    (:class:`WeightedWeatherConfig`) configs.
+
+    Args:
+        config_name: Registered weather config name (e.g., "kelmarsh").
+        forecast_days: Number of forecast days (1-16). Default: 7.
+        past_days: Include N recent past days. Default: 0.
+
+    Returns:
+        Polars DataFrame: timestamp_utc + weather variable columns (hourly).
+    """
+    from windcast.data.open_meteo import build_client, fetch_forecast_weather
+
+    config = get_weather_config(config_name)
+    client = build_client(expire_after=3600)
+
+    if isinstance(config, WeightedWeatherConfig):
+        per_point_dfs: list[tuple[float, pl.DataFrame]] = []
+        for point in config.points:
+            df = fetch_forecast_weather(
+                latitude=point.latitude,
+                longitude=point.longitude,
+                variables=config.variables,
+                forecast_days=forecast_days,
+                past_days=past_days,
+                client=client,
+            )
+            if df.is_empty():
+                logger.warning(
+                    "Empty forecast for point %s (%s,%s)",
+                    point.name,
+                    point.latitude,
+                    point.longitude,
+                )
+                continue
+            per_point_dfs.append((point.weight, df))
+
+        if not per_point_dfs:
+            logger.warning("No forecast data for any point in %s", config.name)
+            return pl.DataFrame(schema={"timestamp_utc": pl.Datetime("us", "UTC")})
+
+        return _weighted_mean(per_point_dfs, config.variables)
+
+    return fetch_forecast_weather(
+        latitude=config.latitude,
+        longitude=config.longitude,
+        variables=config.variables,
+        forecast_days=forecast_days,
+        past_days=past_days,
+        client=client,
     )
 
 

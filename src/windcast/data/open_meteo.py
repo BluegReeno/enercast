@@ -24,6 +24,7 @@ WIND_VARIABLES: list[str] = [
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 
 def build_client(
@@ -133,6 +134,50 @@ def fetch_historical_forecast_weather(
     }
 
     responses = client.weather_api(HISTORICAL_FORECAST_URL, params=params)
+    return _response_to_polars(responses[0], variables)
+
+
+def fetch_forecast_weather(
+    latitude: float,
+    longitude: float,
+    variables: list[str] | None = None,
+    forecast_days: int = 7,
+    past_days: int = 0,
+    client: openmeteo_requests.Client | None = None,
+) -> pl.DataFrame:
+    """Fetch hourly live NWP forecast from Open-Meteo Forecast API.
+
+    Unlike the archive and historical-forecast endpoints, this returns the
+    latest model run output — what the NWP actually predicts right now.
+    Data changes every ~6h as new model runs become available.
+
+    Args:
+        latitude: Location latitude.
+        longitude: Location longitude.
+        variables: Weather variables to fetch. Defaults to WIND_VARIABLES.
+        forecast_days: Number of forecast days (1-16). Default: 7.
+        past_days: Include N recent past days for context. Default: 0.
+        client: Pre-built client. Creates one with 1h cache TTL if None.
+
+    Returns:
+        Polars DataFrame with timestamp_utc + weather variable columns.
+    """
+    if variables is None:
+        variables = WIND_VARIABLES
+    if client is None:
+        client = build_client(expire_after=3600)
+
+    params: dict[str, Any] = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "forecast_days": forecast_days,
+        "past_days": past_days,
+        "hourly": variables,
+        "wind_speed_unit": "ms",
+        "timezone": "UTC",
+    }
+
+    responses = client.weather_api(FORECAST_URL, params=params)
     return _response_to_polars(responses[0], variables)
 
 
