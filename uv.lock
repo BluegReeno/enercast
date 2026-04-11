@@ -5112,6 +5112,7 @@ source = { editable = "." }
 dependencies = [
     { name = "autogluon-tabular", extra = ["all"] },
     { name = "fastexcel" },
+    { name = "httpx" },
     { name = "lightgbm" },
     { name = "mlflow" },
     { name = "mlforecast" },
@@ -5140,6 +5141,7 @@ dev = [
 requires-dist = [
     { name = "autogluon-tabular", extras = ["all"], specifier = ">=1.2" },
     { name = "fastexcel", specifier = ">=0.19.0" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "lightgbm", specifier = ">=4.0" },
     { name = "mlflow", specifier = ">=2.10" },
     { name = "mlforecast", extras = ["polars"], specifier = ">=1.0" },

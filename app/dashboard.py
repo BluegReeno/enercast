@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,8 @@ import plotly.graph_objects as go
 import polars as pl
 import requests
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 # Add project root to path so `scripts.inference` is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -110,6 +113,21 @@ def load_models_for_run(parent_run_id: str) -> dict[int, object]:
         models[horizon] = mlflow.pyfunc.load_model(uri)
 
     return models
+
+
+@st.cache_data(ttl=300)
+def fetch_live_actuals(hours: int = 72) -> pl.DataFrame | None:
+    """Fetch recent observed load from RTE API. Returns None if unavailable."""
+    settings = get_settings()
+    if not settings.rte_client_id or not settings.rte_client_secret:
+        return None
+    try:
+        from windcast.data.rte_api import get_live_actuals
+
+        return get_live_actuals(settings.rte_client_id, settings.rte_client_secret, hours=hours)
+    except Exception as e:
+        logger.warning("Could not fetch live actuals: %s", e)
+        return None
 
 
 def predict_via_server(serve_url: str, X_pd: pd.DataFrame, horizon: int) -> float:
@@ -231,9 +249,30 @@ def make_forecast_chart(
     results: list[dict],
     unit: str,
     domain: str,
+    actuals_df: pl.DataFrame | None = None,
 ) -> go.Figure:
-    """Build a Plotly line chart: prediction vs forecast horizon."""
+    """Build a Plotly line chart: prediction vs forecast horizon.
+
+    When *actuals_df* is provided (demand domain), a blue "Observed" trace is
+    drawn before the green forecast trace, with a vertical dashed separator.
+    """
     fig = go.Figure()
+
+    # Actuals trace (observed load — demand domain only)
+    if actuals_df is not None and not actuals_df.is_empty():
+        fig.add_trace(
+            go.Scatter(
+                x=actuals_df["timestamp_utc"].to_list(),
+                y=actuals_df["load_mw"].to_list(),
+                mode="lines",
+                name="Observed",
+                line={"color": "#1f77b4", "width": 2},
+            )
+        )
+        # Vertical separator at last observed timestamp
+        last_obs = actuals_df["timestamp_utc"].max()
+        if last_obs is not None:
+            fig.add_vline(x=last_obs, line_dash="dash", line_color="gray", opacity=0.6)
 
     timestamps = [r["target_timestamp"] for r in results]
     predictions = [r["prediction"] for r in results]
@@ -354,6 +393,13 @@ with st.sidebar:
         st.caption(f"**Feature set:** {feature_set}")
         st.caption("**Mode:** Champion (registry)")
 
+    # Live actuals availability indicator
+    settings = get_settings()
+    if settings.rte_client_id and domain == "demand":
+        st.caption("**Live actuals:** Available (RTE API)")
+    elif domain == "demand":
+        st.caption("**Live actuals:** Not configured (set WINDCAST_RTE_CLIENT_ID)")
+
 # ---------------------------------------------------------------------------
 # Main area
 # ---------------------------------------------------------------------------
@@ -375,6 +421,12 @@ if run_btn:
             st.session_state["forecast_results"] = results
             st.session_state["forecast_domain"] = domain
             st.session_state["forecast_unit"] = unit
+
+            # Fetch live actuals for demand domain
+            if domain == "demand":
+                st.session_state["forecast_actuals"] = fetch_live_actuals()
+            else:
+                st.session_state["forecast_actuals"] = None
         except Exception as e:
             st.error(f"Forecast failed: {e}")
             st.session_state.pop("forecast_results", None)
@@ -392,7 +444,8 @@ if "forecast_results" in st.session_state:
     col3.metric("Unit", unit_display)
 
     # Chart
-    fig = make_forecast_chart(results, unit_display, domain_display)
+    actuals_df = st.session_state.get("forecast_actuals") if domain_display == "demand" else None
+    fig = make_forecast_chart(results, unit_display, domain_display, actuals_df=actuals_df)
     st.plotly_chart(fig, use_container_width=True)
 
     # Predictions table

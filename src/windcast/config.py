@@ -186,6 +186,10 @@ class WindCastSettings(BaseSettings):
     solar_qc: SolarQCConfig = Field(default_factory=SolarQCConfig)
     mlflow_tracking_uri: str = "sqlite:///mlflow.db"
 
+    # RTE API credentials (optional — live actuals on dashboard)
+    rte_client_id: str | None = None
+    rte_client_secret: str | None = None
+
     @property
     def raw_dir(self) -> Path:
         return self.data_dir / "raw"
