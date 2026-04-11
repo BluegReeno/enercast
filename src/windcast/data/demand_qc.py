@@ -30,9 +30,9 @@ SPAIN_HOLIDAYS: set[date] = {
     date(2018, 3, 30),
 }
 
-# France public holidays (fixed + Easter-derived) for 2014-2024
+# France public holidays (fixed + Easter-derived) for 2014-2026
 FRANCE_HOLIDAYS: set[date] = set()
-for _y in range(2014, 2025):
+for _y in range(2014, 2027):
     FRANCE_HOLIDAYS.update(
         [
             date(_y, 1, 1),  # Jour de l'an
@@ -59,6 +59,8 @@ FRANCE_HOLIDAYS.update(
         date(2022, 4, 18), date(2022, 5, 26), date(2022, 6, 6),
         date(2023, 4, 10), date(2023, 5, 18), date(2023, 5, 29),
         date(2024, 4, 1),  date(2024, 5, 9),  date(2024, 5, 20),
+        date(2025, 4, 21), date(2025, 5, 29), date(2025, 6, 9),
+        date(2026, 4, 6),  date(2026, 5, 14), date(2026, 5, 25),
     ]
 )  # fmt: skip
 
@@ -67,7 +69,7 @@ HOLIDAYS_BY_DATASET: dict[str, set[date]] = {
     "rte_france": FRANCE_HOLIDAYS,
 }
 
-# DST transition dates (last Sunday of March/October) — EU-wide, 2014-2024
+# DST transition dates (last Sunday of March/October) — EU-wide, 2014-2026
 DST_TRANSITION_DATES: set[date] = {
     date(2014, 3, 30), date(2014, 10, 26),
     date(2015, 3, 29), date(2015, 10, 25),
@@ -80,6 +82,8 @@ DST_TRANSITION_DATES: set[date] = {
     date(2022, 3, 27), date(2022, 10, 30),
     date(2023, 3, 26), date(2023, 10, 29),
     date(2024, 3, 31), date(2024, 10, 27),
+    date(2025, 3, 30), date(2025, 10, 26),
+    date(2026, 3, 29), date(2026, 10, 25),
 }  # fmt: skip
 
 

@@ -255,48 +255,19 @@ def run_demand_timeline(
     model_name: str,
     router: Any,
     days: int = 15,
-    display_horizon: int = 24,
     serve_url: str | None = None,
 ) -> dict:
-    """Generate the demand timeline: actuals + stored forecasts + forward forecast.
+    """Generate the demand timeline: actuals + forward forecast.
 
-    Returns dict with keys: actuals_df, stored_forecasts_df, forward_results,
-    mae, mape, n_forecast_points.
+    Stored forecasts are loaded separately via query_stored_forecasts() so the
+    display_horizon dropdown can update without re-running inference.
+
+    Returns dict with keys: actuals_df, forward_results, days, model_name.
     """
-    from windcast.data.forecast_store import ForecastStore
-
-    settings = get_settings()
-
     # 1. Fetch actuals for the timeline
     actuals_df = fetch_actuals_for_timeline(days=days)
 
-    # 2. Load stored forecasts from ForecastStore
-    store_path = settings.data_dir / "forecast_store.db"
-    stored_df = pl.DataFrame(
-        schema={
-            "target_timestamp": pl.Utf8,
-            "horizon_h": pl.Int64,
-            "prediction_mw": pl.Float64,
-            "model_name": pl.Utf8,
-            "domain": pl.Utf8,
-            "dataset": pl.Utf8,
-            "created_at": pl.Utf8,
-        }
-    )
-
-    if store_path.exists():
-        store = ForecastStore(store_path)
-        end_date = dt.datetime.now(dt.UTC)
-        start_date = end_date - dt.timedelta(days=days)
-        stored_df = store.query(
-            start=start_date.strftime("%Y-%m-%d"),
-            end=end_date.strftime("%Y-%m-%d"),
-            horizon_h=display_horizon,
-            model_name=model_name,
-        )
-        store.close()
-
-    # 3. Forward-looking forecast (from now)
+    # 2. Forward-looking forecast (from now)
     forward_results = run_forecast(
         domain="demand",
         dataset=dataset,
@@ -305,33 +276,54 @@ def run_demand_timeline(
         serve_url=serve_url,
     )
 
-    # 4. Compute accuracy metrics (MAE, MAPE) where actuals and forecasts overlap
-    mae = None
-    mape = None
-    n_forecast_points = len(stored_df)
-
-    if actuals_df is not None and not actuals_df.is_empty() and not stored_df.is_empty():
-        # Parse stored timestamps for joining
-        forecast_for_join = stored_df.with_columns(
-            pl.col("target_timestamp").str.to_datetime(time_zone="UTC").alias("timestamp_utc")
-        ).select("timestamp_utc", "prediction_mw")
-
-        merged = actuals_df.join(forecast_for_join, on="timestamp_utc", how="inner")
-
-        if not merged.is_empty():
-            errors = (merged["load_mw"] - merged["prediction_mw"]).abs()
-            mae = errors.mean()
-            pct_errors = errors / merged["load_mw"].abs().clip(lower_bound=1.0) * 100
-            mape = pct_errors.mean()
-
     return {
         "actuals_df": actuals_df,
-        "stored_forecasts_df": stored_df,
         "forward_results": forward_results,
-        "mae": mae,
-        "mape": mape,
-        "n_forecast_points": n_forecast_points,
+        "days": days,
+        "model_name": model_name,
     }
+
+
+def query_stored_forecasts(
+    model_name: str, days: int, display_horizon: int
+) -> tuple[pl.DataFrame, float | None, float | None]:
+    """Query ForecastStore for a given horizon and compute accuracy metrics.
+
+    Called on every Streamlit rerun so the display_horizon dropdown works
+    without re-running the full inference pipeline.
+
+    Returns (stored_df, mae, mape).
+    """
+    from windcast.data.forecast_store import ForecastStore
+
+    settings = get_settings()
+
+    _empty_schema = {
+        "target_timestamp": pl.Utf8,
+        "horizon_h": pl.Int64,
+        "prediction_mw": pl.Float64,
+        "model_name": pl.Utf8,
+        "domain": pl.Utf8,
+        "dataset": pl.Utf8,
+        "created_at": pl.Utf8,
+    }
+
+    store_path = settings.data_dir / "forecast_store.db"
+    if not store_path.exists():
+        return pl.DataFrame(schema=_empty_schema), None, None
+
+    store = ForecastStore(store_path)
+    end_date = dt.datetime.now(dt.UTC)
+    start_date = end_date - dt.timedelta(days=days)
+    stored_df = store.query(
+        start=start_date.strftime("%Y-%m-%d"),
+        end=end_date.strftime("%Y-%m-%d"),
+        horizon_h=display_horizon,
+        model_name=model_name,
+    )
+    store.close()
+
+    return stored_df, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +566,7 @@ st.header("Forecast Results")
 if run_btn:
     if domain == "demand":
         # Demand domain: 15-day timeline view
-        with st.spinner("Fetching actuals, loading forecasts, running inference..."):
+        with st.spinner("Fetching actuals, running inference..."):
             try:
                 timeline = run_demand_timeline(
                     dataset=dataset,
@@ -582,11 +574,9 @@ if run_btn:
                     model_name=model_name,
                     router=router_model,
                     days=timeline_days,
-                    display_horizon=display_horizon,
                     serve_url=SERVE_URL,
                 )
                 st.session_state["demand_timeline"] = timeline
-                st.session_state["demand_display_horizon"] = display_horizon
                 st.session_state.pop("forecast_results", None)
             except Exception as e:
                 st.error(f"Forecast failed: {e}")
@@ -616,29 +606,46 @@ if run_btn:
 # Display demand timeline
 if "demand_timeline" in st.session_state:
     tl = st.session_state["demand_timeline"]
-    dh = st.session_state.get("demand_display_horizon", 24)
+    dh = display_horizon  # read live from sidebar dropdown — updates on every rerun
+
+    # Re-query stored forecasts for the current display_horizon (cheap SQLite query)
+    stored_df, _, _ = query_stored_forecasts(tl["model_name"], tl["days"], dh)
+    n_pts = len(stored_df)
+
+    # Compute accuracy metrics where actuals and forecasts overlap
+    mae = None
+    mape = None
+    actuals_df = tl["actuals_df"]
+    if actuals_df is not None and not actuals_df.is_empty() and not stored_df.is_empty():
+        forecast_for_join = stored_df.with_columns(
+            pl.col("target_timestamp").str.to_datetime(time_zone="UTC").alias("timestamp_utc")
+        ).select("timestamp_utc", "prediction_mw")
+        merged = actuals_df.join(forecast_for_join, on="timestamp_utc", how="inner")
+        if not merged.is_empty():
+            errors = (merged["load_mw"] - merged["prediction_mw"]).abs()
+            mae = errors.mean()
+            pct_errors = errors / merged["load_mw"].abs().clip(lower_bound=1.0) * 100
+            mape = pct_errors.mean()
 
     # Metrics row
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Domain", "Demand")
-
-    n_pts = tl["n_forecast_points"]
     col2.metric("Stored Forecasts", f"{n_pts} points")
 
-    if tl["mae"] is not None:
-        col3.metric(f"MAE (h{dh})", f"{tl['mae']:,.0f} MW")
+    if mae is not None:
+        col3.metric(f"MAE (h{dh})", f"{mae:,.0f} MW")
     else:
         col3.metric(f"MAE (h{dh})", "N/A")
 
-    if tl["mape"] is not None:
-        col4.metric(f"MAPE (h{dh})", f"{tl['mape']:.1f}%")
+    if mape is not None:
+        col4.metric(f"MAPE (h{dh})", f"{mape:.1f}%")
     else:
         col4.metric(f"MAPE (h{dh})", "N/A")
 
     # Timeline chart
     fig = make_demand_timeline_chart(
-        actuals_df=tl["actuals_df"],
-        stored_df=tl["stored_forecasts_df"],
+        actuals_df=actuals_df,
+        stored_df=stored_df,
         forward_results=tl["forward_results"],
         display_horizon=dh,
     )
