@@ -123,6 +123,116 @@ def fetch_recent_load(client: RTEClient, hours: int = 48) -> pl.DataFrame:
     return pl.DataFrame(schema={"timestamp_utc": pl.Datetime("us", "UTC"), "load_mw": pl.Float64})
 
 
+def _chunk_dates(
+    start: datetime, end: datetime, chunk_days: int = 180
+) -> list[tuple[datetime, datetime]]:
+    """Split a date range into API-safe chunks (max 186 days per call)."""
+    chunks: list[tuple[datetime, datetime]] = []
+    current = start
+    while current < end:
+        chunk_end = min(current + timedelta(days=chunk_days), end)
+        chunks.append((current, chunk_end))
+        current = chunk_end
+    return chunks
+
+
+def fetch_load_history(
+    client: RTEClient,
+    start: datetime,
+    end: datetime,
+    types: str = "REALISED",
+    chunk_days: int = 180,
+    sleep_between: float = 0.5,
+) -> pl.DataFrame:
+    """Fetch load history in chunks, returning hourly DataFrame.
+
+    Args:
+        client: Authenticated RTEClient instance.
+        start: Start datetime (UTC).
+        end: End datetime (UTC).
+        types: Comma-separated types (e.g. "REALISED", "REALISED,D-1").
+        chunk_days: Days per API chunk (max 186, default 180 for safety).
+        sleep_between: Courtesy sleep between chunks (seconds).
+
+    Returns:
+        Polars DataFrame: (timestamp_utc, load_mw) for REALISED.
+        If types includes "D-1", also includes forecast_mw column.
+    """
+    chunks = _chunk_dates(start, end, chunk_days)
+    all_realised: list[pl.DataFrame] = []
+    all_d1: list[pl.DataFrame] = []
+    include_d1 = "D-1" in types
+
+    for i, (chunk_start, chunk_end) in enumerate(chunks):
+        logger.info(
+            "Fetching chunk %d/%d: %s → %s",
+            i + 1,
+            len(chunks),
+            chunk_start.date(),
+            chunk_end.date(),
+        )
+
+        data = client.get(
+            "consumption/v1/short_term",
+            params={
+                "start_date": _rte_datetime(chunk_start),
+                "end_date": _rte_datetime(chunk_end),
+                "type": types,
+            },
+        )
+
+        for series in data.get("short_term", []):
+            if series.get("type") == "REALISED":
+                df = _parse_realised_values(series.get("values", []))
+                if not df.is_empty():
+                    all_realised.append(df)
+            elif series.get("type") == "D-1" and include_d1:
+                df = _parse_d1_values(series.get("values", []))
+                if not df.is_empty():
+                    all_d1.append(df)
+
+        if i < len(chunks) - 1 and sleep_between > 0:
+            time.sleep(sleep_between)
+
+    if not all_realised:
+        cols: list[tuple[str, pl.DataType]] = [
+            ("timestamp_utc", pl.Datetime("us", "UTC")),
+            ("load_mw", pl.Float64()),
+        ]
+        if include_d1:
+            cols.append(("forecast_mw", pl.Float64()))
+        return pl.DataFrame(schema=dict(cols))
+
+    result = pl.concat(all_realised).sort("timestamp_utc").unique("timestamp_utc")
+
+    if include_d1 and all_d1:
+        d1_df = pl.concat(all_d1).sort("timestamp_utc").unique("timestamp_utc")
+        result = result.join(d1_df, on="timestamp_utc", how="left")
+
+    logger.info("Fetched %d hourly rows (%s → %s)", len(result), start.date(), end.date())
+    return result
+
+
+def _parse_d1_values(values: list[dict]) -> pl.DataFrame:
+    """Parse RTE D-1 forecast values into hourly DataFrame.
+
+    Returns DataFrame with columns: timestamp_utc (Datetime[UTC]), forecast_mw (Float64).
+    """
+    if not values:
+        return pl.DataFrame(
+            schema={"timestamp_utc": pl.Datetime("us", "UTC"), "forecast_mw": pl.Float64}
+        )
+
+    rows = []
+    for v in values:
+        ts = datetime.fromisoformat(v["start_date"]).astimezone(UTC)
+        rows.append({"timestamp_utc": ts, "forecast_mw": float(v["value"])})
+
+    df = pl.DataFrame(rows).sort("timestamp_utc")
+    df = df.group_by_dynamic("timestamp_utc", every="1h").agg(pl.col("forecast_mw").mean())
+    return df
+
+
 def get_live_actuals(client_id: str, client_secret: str, hours: int = 48) -> pl.DataFrame:
     """Convenience wrapper: create client + fetch recent load.
 

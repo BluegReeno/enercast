@@ -8,7 +8,13 @@ from unittest.mock import MagicMock, patch
 import polars as pl
 import pytest
 
-from windcast.data.rte_api import RTEClient, _parse_realised_values, fetch_recent_load
+from windcast.data.rte_api import (
+    RTEClient,
+    _chunk_dates,
+    _parse_realised_values,
+    fetch_load_history,
+    fetch_recent_load,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -198,3 +204,101 @@ class TestFetchRecentLoad:
             pytest.raises(httpx.HTTPStatusError),
         ):
             fetch_recent_load(client, hours=48)
+
+
+# ---------------------------------------------------------------------------
+# _chunk_dates
+# ---------------------------------------------------------------------------
+
+
+class TestChunkDates:
+    def test_single_chunk_under_180(self):
+        from datetime import UTC, datetime
+
+        start = datetime(2025, 1, 1, tzinfo=UTC)
+        end = datetime(2025, 3, 1, tzinfo=UTC)
+        chunks = _chunk_dates(start, end, chunk_days=180)
+        assert len(chunks) == 1
+        assert chunks[0] == (start, end)
+
+    def test_multiple_chunks_400_days(self):
+        from datetime import UTC, datetime, timedelta
+
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        end = start + timedelta(days=400)
+        chunks = _chunk_dates(start, end, chunk_days=180)
+        assert len(chunks) == 3  # 180 + 180 + 40
+
+        # First chunk is 180 days
+        assert (chunks[0][1] - chunks[0][0]).days == 180
+        # Chunks are contiguous
+        assert chunks[0][1] == chunks[1][0]
+        assert chunks[1][1] == chunks[2][0]
+        # Last chunk ends at end
+        assert chunks[-1][1] == end
+
+    def test_exact_180_days_single_chunk(self):
+        from datetime import UTC, datetime, timedelta
+
+        start = datetime(2025, 1, 1, tzinfo=UTC)
+        end = start + timedelta(days=180)
+        chunks = _chunk_dates(start, end, chunk_days=180)
+        assert len(chunks) == 1
+
+    def test_empty_range(self):
+        from datetime import UTC, datetime
+
+        start = datetime(2025, 1, 1, tzinfo=UTC)
+        chunks = _chunk_dates(start, start, chunk_days=180)
+        assert len(chunks) == 0
+
+
+# ---------------------------------------------------------------------------
+# fetch_load_history
+# ---------------------------------------------------------------------------
+
+
+class TestFetchLoadHistory:
+    def test_fetches_in_chunks_and_concatenates(self):
+        from datetime import UTC, datetime, timedelta
+
+        client = RTEClient("test-id", "test-secret")
+        client._token = "valid-token"
+        client._token_expires_at = time.time() + 3600
+
+        # Build a realistic multi-chunk response
+        call_count = 0
+
+        def mock_get(endpoint, params=None):
+            nonlocal call_count
+            call_count += 1
+            return REALISTIC_API_RESPONSE
+
+        client.get = mock_get  # type: ignore[assignment]
+
+        start = datetime(2025, 1, 1, tzinfo=UTC)
+        end = start + timedelta(days=200)
+
+        with patch("windcast.data.rte_api.time.sleep"):
+            df = fetch_load_history(client, start, end, chunk_days=180)
+
+        # Should have made 2 API calls (200 days / 180 per chunk)
+        assert call_count == 2
+        assert not df.is_empty()
+        assert "timestamp_utc" in df.columns
+        assert "load_mw" in df.columns
+
+    def test_empty_response_returns_empty_df(self):
+        from datetime import UTC, datetime
+
+        client = RTEClient("test-id", "test-secret")
+        client._token = "valid-token"
+        client._token_expires_at = time.time() + 3600
+
+        client.get = lambda *a, **kw: {"short_term": []}  # type: ignore[assignment]
+
+        start = datetime(2025, 1, 1, tzinfo=UTC)
+        end = datetime(2025, 1, 10, tzinfo=UTC)
+
+        df = fetch_load_history(client, start, end)
+        assert df.is_empty()

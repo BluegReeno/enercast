@@ -171,6 +171,7 @@ class WindCastSettings(BaseSettings):
         env_file=".env",
         env_nested_delimiter="__",
         extra="ignore",
+        populate_by_name=True,
     )
 
     data_dir: Path = Path("data")
@@ -187,8 +188,14 @@ class WindCastSettings(BaseSettings):
     mlflow_tracking_uri: str = "sqlite:///mlflow.db"
 
     # RTE API credentials (optional — live actuals on dashboard)
-    rte_client_id: str | None = None
-    rte_client_secret: str | None = None
+    # Read from RTE_CLIENT_ID / RTE_CLIENT_SECRET (no WINDCAST_ prefix)
+    # to share credentials with wattcast.
+    rte_client_id: str | None = Field(
+        default=None, validation_alias="RTE_CLIENT_ID"
+    )
+    rte_client_secret: str | None = Field(
+        default=None, validation_alias="RTE_CLIENT_SECRET"
+    )
 
     @property
     def raw_dir(self) -> Path:

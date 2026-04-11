@@ -39,15 +39,19 @@ def _extract_nwp_at_horizon(
     nwp_df: pl.DataFrame,
     horizon: int,
     resolution_minutes: int,
+    reference_time: datetime | None = None,
 ) -> dict[str, float]:
     """Extract NWP values at the forecast target time.
 
-    Picks the NWP row closest to ``now + horizon * resolution`` and returns
-    a dict with canonical column names (``nwp_{var}``, no ``_h{n}`` suffix).
-    """
-    from datetime import UTC, datetime, timedelta
+    Picks the NWP row closest to ``reference_time + horizon * resolution`` and
+    returns a dict with canonical column names (``nwp_{var}``, no ``_h{n}`` suffix).
 
-    target_time = datetime.now(UTC) + timedelta(minutes=horizon * resolution_minutes)
+    Args:
+        reference_time: When the forecast is "made". Defaults to now (UTC).
+    """
+    target_time = (reference_time or datetime.now(UTC)) + timedelta(
+        minutes=horizon * resolution_minutes
+    )
     nwp_cols = [c for c in nwp_df.columns if c != "timestamp_utc"]
 
     # Find the closest NWP timestamp to the target
@@ -75,6 +79,7 @@ def build_inference_features(
     feature_set_name: str,
     horizon: int,
     resolution_minutes: int,
+    reference_time: datetime | None = None,
 ) -> pl.DataFrame:
     """Build a single-row feature vector for inference.
 
@@ -140,7 +145,7 @@ def build_inference_features(
     # Step 2: Extract NWP values at the target horizon
     nwp_cols_needed = [c for c in fs.columns if c.startswith("nwp_")]
     if nwp_cols_needed:
-        nwp_values = _extract_nwp_at_horizon(nwp_df, horizon, resolution_minutes)
+        nwp_values = _extract_nwp_at_horizon(nwp_df, horizon, resolution_minutes, reference_time)
 
         # Add NWP columns to the feature row
         for col in nwp_cols_needed:

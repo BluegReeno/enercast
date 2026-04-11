@@ -76,8 +76,6 @@ def discover_available_models() -> list[dict]:
             continue
 
         # Read domain/dataset from the source run's tags.
-        # enercast.dataset may not exist — infer from model name convention
-        # "enercast-{dataset}-{backend}" or from experiment name "enercast-{dataset}".
         run = client.get_run(champion_version.run_id)
         domain = run.data.tags.get("enercast.domain", "")
         dataset = run.data.tags.get("enercast.dataset", "")
@@ -132,17 +130,20 @@ def load_champion_model(model_name: str) -> Any:
 
 
 @st.cache_data(ttl=300)
-def fetch_live_actuals(hours: int = 72) -> pl.DataFrame | None:
-    """Fetch recent observed load from RTE API. Returns None if unavailable."""
+def fetch_actuals_for_timeline(days: int = 15) -> pl.DataFrame | None:
+    """Fetch actuals for the timeline view — longer range than fetch_live_actuals."""
     settings = get_settings()
     if not settings.rte_client_id or not settings.rte_client_secret:
         return None
     try:
-        from windcast.data.rte_api import get_live_actuals
+        from windcast.data.rte_api import RTEClient, fetch_load_history
 
-        return get_live_actuals(settings.rte_client_id, settings.rte_client_secret, hours=hours)
+        client = RTEClient(settings.rte_client_id, settings.rte_client_secret)
+        end = dt.datetime.now(dt.UTC)
+        start = end - dt.timedelta(days=days)
+        return fetch_load_history(client, start, end, types="REALISED,D-1")
     except Exception as e:
-        logger.warning("Could not fetch live actuals: %s", e)
+        logger.warning("Could not fetch timeline actuals: %s", e)
         return None
 
 
@@ -166,7 +167,7 @@ def predict_via_server(serve_url: str, X_pd: pd.DataFrame, horizon: int) -> floa
 
 
 # ---------------------------------------------------------------------------
-# Forecast runner
+# Forecast runner (wind + forward-looking demand)
 # ---------------------------------------------------------------------------
 
 
@@ -244,7 +245,97 @@ def run_forecast(
 
 
 # ---------------------------------------------------------------------------
-# Plotly chart builder
+# Demand timeline: backfill gaps + forward forecast
+# ---------------------------------------------------------------------------
+
+
+def run_demand_timeline(
+    dataset: str,
+    feature_set: str,
+    model_name: str,
+    router: Any,
+    days: int = 15,
+    display_horizon: int = 24,
+    serve_url: str | None = None,
+) -> dict:
+    """Generate the demand timeline: actuals + stored forecasts + forward forecast.
+
+    Returns dict with keys: actuals_df, stored_forecasts_df, forward_results,
+    mae, mape, n_forecast_points.
+    """
+    from windcast.data.forecast_store import ForecastStore
+
+    settings = get_settings()
+
+    # 1. Fetch actuals for the timeline
+    actuals_df = fetch_actuals_for_timeline(days=days)
+
+    # 2. Load stored forecasts from ForecastStore
+    store_path = settings.data_dir / "forecast_store.db"
+    stored_df = pl.DataFrame(
+        schema={
+            "target_timestamp": pl.Utf8,
+            "horizon_h": pl.Int64,
+            "prediction_mw": pl.Float64,
+            "model_name": pl.Utf8,
+            "domain": pl.Utf8,
+            "dataset": pl.Utf8,
+            "created_at": pl.Utf8,
+        }
+    )
+
+    if store_path.exists():
+        store = ForecastStore(store_path)
+        end_date = dt.datetime.now(dt.UTC)
+        start_date = end_date - dt.timedelta(days=days)
+        stored_df = store.query(
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_date.strftime("%Y-%m-%d"),
+            horizon_h=display_horizon,
+            model_name=model_name,
+        )
+        store.close()
+
+    # 3. Forward-looking forecast (from now)
+    forward_results = run_forecast(
+        domain="demand",
+        dataset=dataset,
+        feature_set=feature_set,
+        router=router,
+        serve_url=serve_url,
+    )
+
+    # 4. Compute accuracy metrics (MAE, MAPE) where actuals and forecasts overlap
+    mae = None
+    mape = None
+    n_forecast_points = len(stored_df)
+
+    if actuals_df is not None and not actuals_df.is_empty() and not stored_df.is_empty():
+        # Parse stored timestamps for joining
+        forecast_for_join = stored_df.with_columns(
+            pl.col("target_timestamp").str.to_datetime(time_zone="UTC").alias("timestamp_utc")
+        ).select("timestamp_utc", "prediction_mw")
+
+        merged = actuals_df.join(forecast_for_join, on="timestamp_utc", how="inner")
+
+        if not merged.is_empty():
+            errors = (merged["load_mw"] - merged["prediction_mw"]).abs()
+            mae = errors.mean()
+            pct_errors = errors / merged["load_mw"].abs().clip(lower_bound=1.0) * 100
+            mape = pct_errors.mean()
+
+    return {
+        "actuals_df": actuals_df,
+        "stored_forecasts_df": stored_df,
+        "forward_results": forward_results,
+        "mae": mae,
+        "mape": mape,
+        "n_forecast_points": n_forecast_points,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plotly chart builders
 # ---------------------------------------------------------------------------
 
 
@@ -306,6 +397,88 @@ def make_forecast_chart(
     return fig
 
 
+def make_demand_timeline_chart(
+    actuals_df: pl.DataFrame | None,
+    stored_df: pl.DataFrame,
+    forward_results: list[dict],
+    display_horizon: int,
+) -> go.Figure:
+    """Build a 15-day demand timeline: actuals + stored forecasts + forward forecast."""
+    fig = go.Figure()
+
+    # 1. Actuals (blue line)
+    if actuals_df is not None and not actuals_df.is_empty():
+        fig.add_trace(
+            go.Scatter(
+                x=actuals_df["timestamp_utc"].to_list(),
+                y=actuals_df["load_mw"].to_list(),
+                mode="lines",
+                name="Actuals",
+                line={"color": "#1f77b4", "width": 2},
+            )
+        )
+
+        # D-1 TSO forecast (orange dashed) if available
+        if "forecast_mw" in actuals_df.columns:
+            d1_data = actuals_df.drop_nulls("forecast_mw")
+            if not d1_data.is_empty():
+                fig.add_trace(
+                    go.Scatter(
+                        x=d1_data["timestamp_utc"].to_list(),
+                        y=d1_data["forecast_mw"].to_list(),
+                        mode="lines",
+                        name="RTE D-1 Forecast",
+                        line={"color": "#ff7f0e", "width": 1.5, "dash": "dash"},
+                    )
+                )
+
+    # 2. Stored model forecasts (green line)
+    if not stored_df.is_empty():
+        forecast_ts = stored_df.with_columns(
+            pl.col("target_timestamp").str.to_datetime(time_zone="UTC").alias("ts")
+        ).sort("ts")
+
+        fig.add_trace(
+            go.Scatter(
+                x=forecast_ts["ts"].to_list(),
+                y=forecast_ts["prediction_mw"].to_list(),
+                mode="lines",
+                name=f"Model h{display_horizon} Forecast",
+                line={"color": "#2ca02c", "width": 2},
+            )
+        )
+
+    # 3. Vertical separator at "now"
+    now = dt.datetime.now(dt.UTC)
+    fig.add_vline(x=now, line_dash="dash", line_color="gray", opacity=0.6)
+
+    # 4. Forward forecast (green dots ahead of now)
+    if forward_results:
+        fig.add_trace(
+            go.Scatter(
+                x=[r["target_timestamp"] for r in forward_results],
+                y=[r["prediction"] for r in forward_results],
+                mode="markers+text",
+                name="Forward Forecast",
+                marker={"color": "#2ca02c", "size": 10, "symbol": "circle"},
+                text=[f"{r['prediction']:,.0f}" for r in forward_results],
+                textposition="top center",
+                textfont={"size": 9},
+            )
+        )
+
+    fig.update_layout(
+        xaxis_title="Time (UTC)",
+        yaxis_title="Load (MW)",
+        hovermode="x unified",
+        margin={"l": 60, "r": 20, "t": 40, "b": 40},
+        height=450,
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02},
+    )
+
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Sidebar UI
 # ---------------------------------------------------------------------------
@@ -352,6 +525,18 @@ with st.sidebar:
     if SERVE_URL:
         st.caption(f"**Serve URL:** `{SERVE_URL}`")
 
+    # Demand-specific: timeline controls
+    if domain == "demand":
+        st.divider()
+        timeline_days = st.slider("Days to show", min_value=7, max_value=30, value=15)
+        display_horizon = st.selectbox(
+            "Display horizon",
+            DEFAULT_HORIZONS,
+            index=DEFAULT_HORIZONS.index(24),
+            format_func=lambda h: f"h{h} ({build_horizon_desc(h, 60)})",
+        )
+        assert isinstance(display_horizon, int)
+
     # Generate button
     run_btn = st.button("Generate Forecast", type="primary", use_container_width=True)
 
@@ -377,7 +562,7 @@ with st.sidebar:
     if settings.rte_client_id and domain == "demand":
         st.caption("**Live actuals:** Available (RTE API)")
     elif domain == "demand":
-        st.caption("**Live actuals:** Not configured (set WINDCAST_RTE_CLIENT_ID)")
+        st.caption("**Live actuals:** Not configured (set RTE_CLIENT_ID)")
 
 # ---------------------------------------------------------------------------
 # Main area
@@ -387,31 +572,104 @@ st.header("Forecast Results")
 
 # Handle button click — store results in session state
 if run_btn:
-    with st.spinner("Fetching NWP and running inference..."):
-        try:
-            results = run_forecast(
-                domain=domain,
-                dataset=dataset,
-                feature_set=feature_set,
-                router=router_model,
-                serve_url=SERVE_URL,
-            )
-            st.session_state["forecast_results"] = results
-            st.session_state["forecast_domain"] = domain
-            st.session_state["forecast_unit"] = unit
-
-            # Fetch live actuals for demand domain
-            if domain == "demand":
-                st.session_state["forecast_actuals"] = fetch_live_actuals()
-            else:
+    if domain == "demand":
+        # Demand domain: 15-day timeline view
+        with st.spinner("Fetching actuals, loading forecasts, running inference..."):
+            try:
+                timeline = run_demand_timeline(
+                    dataset=dataset,
+                    feature_set=feature_set,
+                    model_name=model_name,
+                    router=router_model,
+                    days=timeline_days,
+                    display_horizon=display_horizon,
+                    serve_url=SERVE_URL,
+                )
+                st.session_state["demand_timeline"] = timeline
+                st.session_state["demand_display_horizon"] = display_horizon
+                st.session_state.pop("forecast_results", None)
+            except Exception as e:
+                st.error(f"Forecast failed: {e}")
+                logger.exception("Forecast failed")
+                st.session_state.pop("demand_timeline", None)
+    else:
+        # Wind/solar domain: original 5-point forecast
+        with st.spinner("Fetching NWP and running inference..."):
+            try:
+                results = run_forecast(
+                    domain=domain,
+                    dataset=dataset,
+                    feature_set=feature_set,
+                    router=router_model,
+                    serve_url=SERVE_URL,
+                )
+                st.session_state["forecast_results"] = results
+                st.session_state["forecast_domain"] = domain
+                st.session_state["forecast_unit"] = unit
                 st.session_state["forecast_actuals"] = None
-        except Exception as e:
-            st.error(f"Forecast failed: {e}")
-            logger.exception("Forecast failed")
-            st.session_state.pop("forecast_results", None)
+                st.session_state.pop("demand_timeline", None)
+            except Exception as e:
+                st.error(f"Forecast failed: {e}")
+                logger.exception("Forecast failed")
+                st.session_state.pop("forecast_results", None)
 
-# Display results from session state (persists across reruns)
-if "forecast_results" in st.session_state:
+# Display demand timeline
+if "demand_timeline" in st.session_state:
+    tl = st.session_state["demand_timeline"]
+    dh = st.session_state.get("demand_display_horizon", 24)
+
+    # Metrics row
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Domain", "Demand")
+
+    n_pts = tl["n_forecast_points"]
+    col2.metric("Stored Forecasts", f"{n_pts} points")
+
+    if tl["mae"] is not None:
+        col3.metric(f"MAE (h{dh})", f"{tl['mae']:,.0f} MW")
+    else:
+        col3.metric(f"MAE (h{dh})", "N/A")
+
+    if tl["mape"] is not None:
+        col4.metric(f"MAPE (h{dh})", f"{tl['mape']:.1f}%")
+    else:
+        col4.metric(f"MAPE (h{dh})", "N/A")
+
+    # Timeline chart
+    fig = make_demand_timeline_chart(
+        actuals_df=tl["actuals_df"],
+        stored_df=tl["stored_forecasts_df"],
+        forward_results=tl["forward_results"],
+        display_horizon=dh,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Forward predictions table
+    if tl["forward_results"]:
+        st.subheader("Forward Forecast")
+        table_data = [
+            {
+                "Horizon": r["horizon_desc"],
+                "Target Time (UTC)": r["target_timestamp"].strftime("%Y-%m-%d %H:%M"),
+                "Prediction (MW)": f"{r['prediction']:,.1f}",
+            }
+            for r in tl["forward_results"]
+        ]
+        st.table(table_data)
+
+    # Backfill hint
+    if n_pts == 0:
+        st.info(
+            "No stored forecasts found. Run the backfill script to populate "
+            "historical forecasts:\n\n"
+            "```bash\n"
+            "uv run python scripts/backfill_demand_forecasts.py "
+            "--start 2025-01-01 --end 2026-04-11\n"
+            "```"
+        )
+
+# Display wind/solar results from session state (persists across reruns)
+elif "forecast_results" in st.session_state:
     results = st.session_state["forecast_results"]
     domain_display = st.session_state["forecast_domain"]
     unit_display = st.session_state["forecast_unit"]

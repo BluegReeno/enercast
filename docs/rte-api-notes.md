@@ -1,194 +1,205 @@
-# RTE Data API — Notes d'exploration
+# RTE Data API — Complete Reference
 
-**Date du test** : 2026-04-09
-**Contexte** : évaluation de la viabilité de l'API RTE pour remplacer l'ingestion fichier (éCO2mix annuel) par un flux live, dans le cadre de la démo WeatherNews.
-**Statut** : exploratoire — **pas intégré au framework**, les fichiers locaux `data/ecomix-rte/*.zip` restent la source primaire pour la démo WN.
-
----
-
-## Résumé exécutif
-
-L'API RTE Data est **productionisable**, avec des contraintes claires et documentées. Le portail développeur est catastrophique à naviguer, mais une fois les abonnements activés, l'API elle-même est propre, stable, et documentée. Pour un déploiement live de notre framework demand, il suffit de remplacer le lecteur de fichiers par un client OAuth2 : ~30 lignes de code, pattern déjà existant dans le projet voisin `wattcast`.
-
-**Verdict** : swap fichier → API = 15 minutes de dev si le pattern wattcast est porté en sync. Le reste du pipeline (schema, QC, features, training, MLflow) ne change pas.
+**Last tested**: 2026-04-11
+**Status**: `consumption/v1/short_term` integrated in `rte_api.py`. Other endpoints documented for future use.
+**Credentials**: `RTE_CLIENT_ID` / `RTE_CLIENT_SECRET` in `.env` (shared with wattcast)
 
 ---
 
-## Credentials
-
-Credentials de test stockés hors repo (dans `.env` local ou vault) :
+## Authentication
 
 ```
-WINDCAST_RTE_CLIENT_ID=<uuid v4>
-WINDCAST_RTE_CLIENT_SECRET=<uuid v4>
+POST https://digital.iservices.rte-france.com/token/oauth/
+Authorization: Basic base64(client_id:client_secret)
+→ { access_token, token_type: "Bearer", expires_in: 3600 }
 ```
 
-**Ne jamais commiter** ces valeurs. Obtenues via inscription sur https://data.rte-france.com/ → création d'une "Application" → souscription manuelle aux API individuelles (une souscription = un endpoint).
+- TTL: 3600 s (1 hour), refresh 60 s before expiry
+- No scope required
+- Register at https://data.rte-france.com → Create Application → Subscribe to each API individually
 
 ---
 
-## Endpoints testés
+## Subscribed Endpoints (tested 2026-04-11)
 
-### OAuth2 Token — `POST /token/oauth/`
+### `consumption/v1/short_term` ✅
 
+**The main endpoint for our use case.** Real-time actuals + TSO forecasts.
+
+| Parameter | Values | Notes |
+|-----------|--------|-------|
+| `start_date` | ISO 8601 with TZ | Required as pair |
+| `end_date` | ISO 8601 with TZ | Required as pair |
+| `type` | `REALISED,D-1,D-2,ID` | Comma-separated, all returned if omitted |
+
+**Types available:**
+
+| Type | Resolution | Description |
+|------|-----------|-------------|
+| `REALISED` | 15 min (96/day) | Metered actual consumption |
+| `D-1` | 15 min (96/day) | Day-ahead forecast (RTE official) |
+| `D-2` | 30 min (48/day) | 2-day-ahead forecast |
+| `ID` | 15 min (96/day) | Intraday forecast |
+| `CORRECTED` | — | Exists but returned 0 values in tests |
+
+**Limits:**
+- **Max range per call: 186 days** (190 → HTTP 400 `CONSUMPTION_SHORTTERM_F03`)
+- **History: since 2014** (tested 2014-01-01 ✅, older dates may return 0 values)
+- **Freshness: ~minutes** (`updated_date` near real-time for current day)
+
+**Value structure:**
+```json
+{
+  "start_date": "2026-04-10T00:00:00+02:00",
+  "end_date": "2026-04-10T00:15:00+02:00",
+  "updated_date": "2026-04-10T23:49:33+02:00",
+  "value": 44909
+}
 ```
-URL   : https://digital.iservices.rte-france.com/token/oauth/
-Auth  : Basic base64(client_id:client_secret)
-Réponse : { access_token, token_type=Bearer, expires_in=3600, scope }
-```
 
-- **TTL** : 3600 s (1 heure)
-- **Pas de scope** requis
-- **Zero friction** : 1 appel, tout fonctionne
+**Chunking strategy for backfill:**
+- 2014 → 2026 (~4,400 days) = ~24 chunks of 180 days
+- ~24 API calls, ~2-3 min with 0.5 s courtesy sleep
+- Pattern: `_chunk_dates(start, end, chunk_days=180)` (WattCast uses 150, but 180 is safe)
 
-### ✅ `consumption/v1/short_term` (PROD)
+---
 
-```
-URL    : https://digital.iservices.rte-france.com/open_api/consumption/v1/short_term
-Auth   : Bearer <token>
-Params : start_date, end_date (ISO 8601 avec offset), type=REALISED,D-1
-```
+### `consumption/v1/weekly_forecasts` ✅
 
-**Ce qui marche :**
-- **Résolution native : 15 min** (plus fin que les fichiers éCO2mix qui sont en 30 min pour la consommation)
-- **REALISED + D-1 en un seul appel** via `type=REALISED,D-1` (comma-separated, pas d'espace)
-- **Historique profond** : testé OK jusqu'en 2016-04-10 ; 2011-04-12 retourne 0 valeurs (cap empirique ~2014-2015)
-- **Forecast D-1 historique disponible** — pas seulement pour demain, donc on peut backtester notre modèle vs la prévision officielle RTE sur toute la période validation
-- **Données temps réel** : dernière valeur à quelques minutes près (testé : `updated_date` = 23:50:03 pour la journée en cours)
-- **Structure de réponse** :
-  ```json
-  {
-    "short_term": [
-      {
-        "type": "REALISED",
-        "start_date": "...", "end_date": "...",
-        "values": [
-          {"start_date": "...", "end_date": "...", "updated_date": "...", "value": 44778},
-          ...
-        ]
+Medium-range load forecasts (D+3 to D+9).
+
+| Parameter | Values |
+|-----------|--------|
+| `start_date` | ISO 8601 with TZ |
+| `end_date` | ISO 8601 with TZ |
+
+- **Resolution**: 30 min (48 values/day)
+- **Max range per call**: 155 days
+- **History**: since 2004-12-23
+- **No new forecasts on weekends** — each series has an `updated_date`
+- **Bonus data**: `peak` object with `peak_hour`, `value` (MW), `temperature` (°C), `temperature_deviation` (°C)
+
+**Response structure:**
+```json
+{
+  "weekly_forecasts": [
+    {
+      "start_date": "2026-04-07T00:00:00+02:00",
+      "end_date": "2026-04-08T00:00:00+02:00",
+      "updated_date": "2026-04-03T11:15:03+02:00",
+      "peak": {
+        "peak_hour": "2026-04-07T08:30:00+02:00",
+        "value": 52000,
+        "temperature": 10.9,
+        "temperature_deviation": 5.2
       },
-      { "type": "D-1", "values": [...] }
-    ]
-  }
-  ```
-
-**Limite critique — chunks 150 jours max** :
-- 30 jours → HTTP 200, 2 780 valeurs
-- 150 jours → HTTP 200, 14 240 valeurs
-- 200 jours → **HTTP 400** `CONSUMPTION_SHORTTERM_F03` : _"The API does not provide feedback on such a long period in one call. To retrieve all the..."_
-- 365 jours → même erreur
-
-Pour backfiller 2014 → 2024 (~3 650 jours), il faut ~25 chunks, ~25 appels, temps total estimé **2-3 minutes** avec 0.5 s de courtoisie entre chunks.
-
-### ✅ `wholesale_market/v3/france_power_exchanges` (PROD)
-
-```
-URL : https://digital.iservices.rte-france.com/open_api/wholesale_market/v3/france_power_exchanges
+      "values": [
+        {"start_date": "...", "end_date": "...", "value": 43378}
+      ]
+    }
+  ]
+}
 ```
 
-Bonus non prévu qui **marche** avec nos credentials :
-- Prix spot marché (€/MWh) + volumes (MWh) en 15 min
-- Contient déjà les valeurs du **lendemain** (publication marché J-1 midi)
-- Exemple réel : `{"value": 20068.3, "price": 35.43}` pour 2026-04-10 00:00
-- Structure : `{ "france_power_exchanges": [ { "start_date", "end_date", "updated_date", "values": [...] } ] }`
-
-Utilisable en l'état comme feature exogène `price_eur_mwh` pour un modèle demand price-aware — **non nécessaire pour Pass 7** mais noté comme polish future.
-
-### ⚠️ `consumption/v1/sandbox/short_term` — inutile
-
-Le sandbox renvoie **toujours les mêmes données figées du 2016-02-01** (échantillon statique pour tester le format sans consommer le quota PROD). Contient des types exotiques (`ID`, `D-2`) qui n'existent probablement pas tous en PROD. **Zéro valeur** pour notre cas d'usage : utiliser directement PROD.
-
-### ❌ Sous-endpoints wholesale non autorisés (HTTP 403)
-
-Ces endpoints existent mais notre souscription actuelle ne les couvre pas :
-
-| Endpoint | HTTP | Note |
-|---|---|---|
-| `wholesale_market/v3` (root) | 403 | Root non exposé |
-| `wholesale_market/v3/epex_france_power_auction` | 403 | Abonnement séparé requis |
-| `wholesale_market/v3/eod_france_power_exchanges` | 403 | Abonnement séparé requis |
-| `wholesale_market/v3/clearing_prices` | 403 | Abonnement séparé requis |
-
-**Pattern RTE** : chaque API est un abonnement distinct à activer manuellement dans le catalogue. Pour ajouter un endpoint, retourner sur le portail, chercher l'API dans le catalogue, cliquer "Souscrire". Pas de wildcard, pas de groupe.
+**Use case**: Could serve as a 2nd TSO benchmark (week-ahead vs our h48 model), or as a feature input for longer-horizon models. Not currently integrated.
 
 ---
 
-## Pattern de code de référence
+### `consumption/v1/annual_forecasts` ✅
 
-Le client OAuth2 complet existe déjà dans le projet voisin : **`../wattcast/src/wattcast/data/rte.py`** (lignes 31-134). Wattcast utilise `httpx.AsyncClient`. Pour porter en sync vers windcast :
+Seasonal/annual outlook — weekly resolution.
 
-- Remplacer `httpx.AsyncClient` → `httpx.Client`
-- Retirer `async`/`await` et `asyncio.Lock`
-- Garder la logique de cache token (expiration check avec `TOKEN_TTL_BUFFER = 60`)
-- Garder le pattern `_chunk_dates(start, end, chunk_days=150)` pour le backfill
-- Remplacer la sortie pandas par Polars (`pl.DataFrame` from list of dicts)
-
-Estimation porting : **~80 lignes, 30 minutes de dev**.
+- **Resolution**: weekly (52 values/year)
+- **Range**: min 1 calendar year, max 6 years
+- **History**: since 2015
+- **Content**: `average_load_saturday_to_friday`, `average_load_monday_to_sunday`, min/max
+- **Use case**: Contextual only (presentation slide). Not useful for hourly forecasting.
 
 ---
 
-## Comparaison fichiers éCO2mix vs API
+### `wholesale_market/v3/france_power_exchanges` ✅
 
-| Critère | Fichiers `data/ecomix-rte/*.zip` | API `/consumption/v1/short_term` |
-|---|---|---|
-| **Résolution consommation** | 30 min | **15 min** |
-| **Résolution forecast D-1** | 15 min | 15 min |
-| **Historique** | 2014-2024 (11 ans dispo localement) | 2014/15 → aujourd'hui |
-| **Temps réel** | Non (annuel définitif, J+1 an) | **Oui, ~H-1 min** |
-| **Données consolidées** | Définitif = meilleure qualité | REALISED (révisions possibles) |
-| **Credentials requis** | Non | Oui (OAuth2) |
-| **Réseau requis** | Non | Oui |
-| **Reproductibilité** | **Totale** (ZIP versionnés) | Dépend des révisions serveur |
-| **Volume par backfill 10 ans** | ~50 MB × 11 fichiers | ~25 appels × 150 jours |
-| **Temps backfill complet** | Instantané (lecture disque) | ~2-3 min |
-| **Risque production** | Aucun (offline) | Network, quotas, credentials |
-| **Refresh quotidien** | Re-télécharger 1× par an | **1 appel API/jour** |
+Spot market prices and volumes.
 
-**Conclusion** : pour la démo WN (déterministe, offline, une seule fois), les fichiers sont supérieurs. Pour une exécution en production live, l'API est supérieure et triviale à brancher.
+- **Resolution**: 15 min (96 values/day)
+- **Content**: `value` (volume MWh), `price` (€/MWh)
+- **Includes next-day prices** (published D-1 at noon)
+- **Use case**: `price_eur_mwh` feature for price-aware demand models. Not currently integrated but ready to plug in.
 
 ---
 
-## Verdict productionisation
+### `generation_forecast/v3/forecasts` ✅
 
-| Critère | Verdict |
-|---|---|
-| **Authentification** | OAuth2 standard, 1h TTL, auto-refresh trivial |
-| **Documentation** | Documentée en ligne, code de référence wattcast, messages d'erreur explicites |
-| **Stabilité** | Existe depuis années, utilisée en production par wattcast |
-| **Historique suffisant** | ~10 ans — largement assez pour ML |
-| **Temps réel** | Latence quelques minutes — OK pour day-ahead forecasting |
-| **Chunking** | 150 jours max par appel (documenté empiriquement) |
-| **Rate limits** | Non observés, wattcast sleep 0.5 s par courtoisie |
-| **Fiabilité réseau** | Standard httpx, retries à implémenter basiquement |
-| **Coût dev (port sync)** | ~30 minutes (pattern existe) |
-| **Coût opérationnel** | Nul (API gratuite pour usage standard) |
-| **Seul pain point** | Portail développeur RTE très peu ergonomique |
+Day-ahead generation forecasts by production type.
 
-**Productionisable : oui.** Pour intégrer en mode live dans windcast, il suffit d'ajouter :
-1. Les credentials `WINDCAST_RTE_CLIENT_ID` / `WINDCAST_RTE_CLIENT_SECRET` dans `.env`
-2. Un client `src/windcast/data/rte_france_api.py` (port sync du pattern wattcast)
-3. Un ingest script `scripts/ingest_rte_france_live.py` qui fetch + concat à la parquet existante
-4. Un scheduler (cron/hook) pour le refresh quotidien
-
-Le reste du pipeline (schema, QC, features, training, MLflow) est **strictement inchangé** — c'est tout l'intérêt du pattern "parser + canonical schema".
+- Used by WattCast for nuclear/renewable generation forecasting
+- Not needed for demand-only pipeline
 
 ---
 
-## Utilité pour le pitch WeatherNews
+### `actual_generation/v1/actual_generations_per_production_type` ✅
 
-Cette analyse nourrit directement une slide **"Production Roadmap"** de la présentation :
+Actual generation by fuel type (nuclear, wind, solar, gas, etc.).
 
-> *"Le parser de la démo lit les fichiers annuels RTE. Pour une exécution en production, on remplace la lecture fichier par un client OAuth2 vers `/open_api/consumption/v1/short_term` — 30 minutes de dev, pattern déjà validé dans un projet voisin. Refresh quotidien = 1 appel API. Le reste du pipeline (schema, QC, features, training, MLflow) reste strictement identique. C'est le point clé du framework : l'ingestion est pluggable, tout le reste est figé."*
-
-Message WN : **migration incrémentale, composants remplaçables, pas de big-bang**. Exactement ce qu'ils cherchent pour sortir de MARS (cf. `docs/WNchallenge/CR WeatherNews...`).
+- Used by WattCast for generation mix analysis
+- Could be useful as features for demand models (generation mix → demand context)
 
 ---
 
-## Références
+## Not Subscribed (HTTP 403)
 
-- Portail développeur : https://data.rte-france.com/
-- Token endpoint : `POST https://digital.iservices.rte-france.com/token/oauth/`
-- Base API : `https://digital.iservices.rte-france.com/open_api`
-- Client de référence complet : `../wattcast/src/wattcast/data/rte.py` (fetch_load, fetch_generation, fetch_nuclear_unavailability, _chunk_dates, RTEClient)
-- Tests de référence : `../wattcast/tests/test_data/test_rte.py` (mocks httpx, token caching, date chunking)
-- Licence RTE data : Etalab 2.0 — https://www.etalab.gouv.fr/licence-ouverte-open-licence
+These require separate subscriptions on the RTE portal:
+
+| Endpoint | Status | Notes |
+|----------|--------|-------|
+| `consolidated_consumption/v1/consolidated_power_consumption` | 403 | Definitive 30-min data since 1996 |
+| `consolidated_consumption/v1/consolidated_energy_consumption` | 403 | Definitive daily data since 1996 |
+| `ecowatt/v5/signals` | 403 | Grid stress signals |
+| `wholesale_market/v3/epex_france_power_auction` | 403 | Separate subscription |
+| `wholesale_market/v3/eod_france_power_exchanges` | 403 | Separate subscription |
+| `wholesale_market/v3/clearing_prices` | 403 | Separate subscription |
+
+**To subscribe**: Portal → API Catalog → find the API → "Souscrire". Each API is a separate subscription. No wildcard/grouping.
+
+**Note on `consolidated_consumption`**: Would give higher-quality definitive data (vs REALISED which can be revised), but `REALISED` is sufficient for our use case — the differences are minimal for hourly aggregates.
+
+---
+
+## Comparison: Local Files vs API
+
+| Criterion | Files `data/ecomix-rte/*.zip` | API `short_term` |
+|-----------|-------------------------------|-------------------|
+| **Resolution** | 30 min (consumption) | **15 min** |
+| **History** | 2014-2024 (local) | **2014 → today** |
+| **Real-time** | No | **Yes (~minutes lag)** |
+| **Quality** | Définitif (best) | REALISED (revisions possible) |
+| **Credentials** | No | Yes (OAuth2) |
+| **Network** | No | Yes |
+| **Reproducibility** | **Total** (files versioned) | Depends on server |
+| **TSO D-1 forecast** | In files (`Prévision J-1`) | In API (`type=D-1`) |
+
+**Conclusion**: Files for reproducible training/validation. API for 2025+ live data and dashboard.
+
+---
+
+## Implementation in WindCast
+
+### Current (`src/windcast/data/rte_api.py`)
+
+- `RTEClient` — sync OAuth2 client (ported from WattCast async pattern)
+- `fetch_recent_load(client, hours=48)` — fetches REALISED from `short_term`
+- `get_live_actuals(client_id, secret, hours=48)` — convenience wrapper
+- Resamples 15-min → hourly via `group_by_dynamic`
+
+### Needed for dashboard backfill
+
+- `_chunk_dates(start, end, chunk_days=180)` — split long ranges into API-safe chunks
+- `fetch_load_history(client, start, end)` — chunked REALISED + D-1 fetch
+- `ForecastStore` — SQLite table for prediction results
+
+### Reference: WattCast pattern (`../wattcast/src/wattcast/data/rte.py`)
+
+- Async `RTEClient` with `httpx.AsyncClient`
+- `_chunk_dates(start, end, chunk_days=150)` for load, 20 for generation
+- `collect_load()` backfills 2019-2025 by chunks → Supabase PostgreSQL
+- Fetches `REALISED` + `D-1` in single call via `type=REALISED,D-1`
