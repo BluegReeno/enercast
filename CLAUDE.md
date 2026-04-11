@@ -24,7 +24,7 @@
 | **Package manager** | uv | Fast, lockfile-based |
 | **Data processing** | Polars (primary) | 10-min SCADA data |
 | **ML models** | XGBoost, AutoGluon-Tabular, LightGBM, scikit-learn | 2 backends via Protocol |
-| **Experiment tracking** | MLflow | Model registry, comparison UI |
+| **Experiment tracking** | MLflow 3.x | Model registry, comparison UI |
 | **Hyperparameter tuning** | Optuna | Bayesian optimization |
 | **Weather data** | Open-Meteo | Free NWP forecasts |
 | **Linting** | ruff | Lint + format |

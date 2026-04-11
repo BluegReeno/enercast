@@ -24,8 +24,7 @@ import polars as pl
 
 from windcast.config import DOMAIN_RESOLUTION, get_settings
 from windcast.features.registry import get_feature_set
-from windcast.features.weather import join_nwp_horizon_features
-from windcast.training.harness import build_horizon_desc, resolve_horizon_features
+from windcast.training.harness import build_horizon_desc
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,39 @@ UNIT_BY_DOMAIN: dict[str, str] = {
     "demand": "MW",
     "solar": "kW",
 }
+
+
+def _extract_nwp_at_horizon(
+    nwp_df: pl.DataFrame,
+    horizon: int,
+    resolution_minutes: int,
+) -> dict[str, float]:
+    """Extract NWP values at the forecast target time.
+
+    Picks the NWP row closest to ``now + horizon * resolution`` and returns
+    a dict with canonical column names (``nwp_{var}``, no ``_h{n}`` suffix).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    target_time = datetime.now(UTC) + timedelta(minutes=horizon * resolution_minutes)
+    nwp_cols = [c for c in nwp_df.columns if c != "timestamp_utc"]
+
+    # Find the closest NWP timestamp to the target
+    nwp_sorted = nwp_df.sort("timestamp_utc")
+    ts_col = pl.col("timestamp_utc").cast(pl.Datetime("us", "UTC"))
+    target_lit = pl.lit(target_time).cast(pl.Datetime("us", "UTC"))
+    diffs = nwp_sorted.with_columns((ts_col - target_lit).abs().alias("_diff"))
+    closest = diffs.sort("_diff").head(1)
+
+    if closest.is_empty():
+        return {}
+
+    result: dict[str, float] = {}
+    for col in nwp_cols:
+        val = closest[col][0]
+        if val is not None:
+            result[f"nwp_{col}"] = float(val)
+    return result
 
 
 def build_inference_features(
@@ -46,12 +78,15 @@ def build_inference_features(
 ) -> pl.DataFrame:
     """Build a single-row feature vector for inference.
 
-    Reuses the same feature builders as training to guarantee feature parity.
+    Decouples lag/calendar features (from actuals) from NWP features (from live
+    forecast). This works even when actuals and NWP have no timestamp overlap —
+    the normal case in production where actuals are historical and NWP is a
+    fresh forecast.
 
-    1. Join NWP at the target horizon onto the actuals tail.
-    2. Build domain features (lags, rolling, cyclic, HDD/CDD).
-    3. Resolve horizon-specific NWP columns → canonical names.
-    4. Return a single-row DataFrame with only the model's input columns.
+    1. Build domain features (lags, rolling, cyclic) from actuals tail.
+    2. Extract NWP values at the target horizon independently.
+    3. Merge into a single feature row.
+    4. Compute derived features (HDD/CDD) from the merged NWP values.
 
     Args:
         actuals_df: Recent actuals from processed Parquet (tail rows for lags).
@@ -67,53 +102,66 @@ def build_inference_features(
     from windcast.features.demand import build_demand_features
     from windcast.features.wind import build_wind_features
 
-    horizons = [horizon]
-
+    # Step 1: Build lag/calendar features from actuals (no NWP join)
     if domain == "demand":
-        # Demand full needs NWP joined BEFORE build_demand_features for HDD/CDD
-        df = join_nwp_horizon_features(
-            actuals_df,
-            nwp_df,
-            horizons=horizons,
-            resolution_minutes=resolution_minutes,
-        )
-        df = build_demand_features(df, feature_set=feature_set_name)
+        # Build without NWP — demand_full's HDD/CDD will be added after NWP merge
+        df = build_demand_features(actuals_df, feature_set=feature_set_name)
     elif domain == "wind":
-        df = build_wind_features(
-            actuals_df,
-            feature_set=feature_set_name,
-            weather_df=nwp_df,
-            horizons=horizons,
-            resolution_minutes=resolution_minutes,
-        )
+        # For wind, build without weather_df so NWP columns are skipped
+        df = build_wind_features(actuals_df, feature_set=feature_set_name)
     else:
         raise ValueError(f"Unsupported domain for inference: {domain!r}")
 
-    # Resolve horizon-specific NWP columns to canonical names
+    # Get the feature set definition
     fs = get_feature_set(feature_set_name)
-    actual_cols, rename_map = resolve_horizon_features(df.columns, fs.columns, horizon)
 
-    # Filter to only the columns the model expects
-    available = [c for c in actual_cols if c in df.columns]
-    if not available:
+    # Select only non-NWP columns the model expects, drop lag warmup nulls
+    non_nwp_cols = [c for c in fs.columns if not c.startswith("nwp_")]
+    # Also exclude derived NWP features (HDD/CDD) — will be recomputed
+    non_nwp_cols = [
+        c for c in non_nwp_cols if c not in ("heating_degree_days", "cooling_degree_days")
+    ]
+    available_non_nwp = [c for c in non_nwp_cols if c in df.columns]
+
+    if not available_non_nwp:
         raise ValueError(
             f"No feature columns available after building. "
-            f"Expected: {actual_cols[:5]}... Available: {df.columns[:10]}..."
+            f"Expected: {non_nwp_cols[:5]}... Available: {df.columns[:10]}..."
         )
 
-    result = df.select(available)
-    if rename_map:
-        result = result.rename(rename_map)
-
-    # Drop rows with any null (lag/rolling warmup) and take the last valid row
-    result = result.drop_nulls()
+    result = df.select(available_non_nwp).drop_nulls()
     if result.is_empty():
         raise ValueError(
             "No valid feature rows after dropping nulls. "
             "Ensure actuals_df has enough rows for lag computation."
         )
+    result = result.tail(1)
 
-    return result.tail(1)
+    # Step 2: Extract NWP values at the target horizon
+    nwp_cols_needed = [c for c in fs.columns if c.startswith("nwp_")]
+    if nwp_cols_needed:
+        nwp_values = _extract_nwp_at_horizon(nwp_df, horizon, resolution_minutes)
+
+        # Add NWP columns to the feature row
+        for col in nwp_cols_needed:
+            if col in nwp_values:
+                result = result.with_columns(pl.lit(nwp_values[col]).alias(col))
+            else:
+                logger.warning("NWP column %s not available in forecast", col)
+                result = result.with_columns(pl.lit(0.0).alias(col))
+
+    # Step 3: Compute derived features (HDD/CDD from NWP temperature)
+    if "heating_degree_days" in fs.columns and "nwp_temperature_2m" in result.columns:
+        result = result.with_columns(
+            pl.max_horizontal(pl.lit(0.0), pl.lit(18.0) - pl.col("nwp_temperature_2m")).alias(
+                "heating_degree_days"
+            ),
+            pl.max_horizontal(pl.lit(0.0), pl.col("nwp_temperature_2m") - pl.lit(24.0)).alias(
+                "cooling_degree_days"
+            ),
+        )
+
+    return result
 
 
 def _load_model_direct(model_uri: str) -> Any:
@@ -131,6 +179,11 @@ def _predict_direct(model: Any, X: pl.DataFrame, horizon: int) -> float:
     and single-horizon models silently ignore unknown params (MLflow pyfunc behavior).
     """
     X_pd = X.to_pandas()
+    # Align dtypes with model signature — integer columns must not be float
+    if hasattr(model, "metadata") and model.metadata.signature:
+        for col_spec in model.metadata.signature.inputs:
+            if col_spec.name in X_pd.columns and col_spec.type == "integer":
+                X_pd[col_spec.name] = X_pd[col_spec.name].astype("int32")
     predictions = model.predict(X_pd, params={"horizon": horizon})
     return float(predictions[0])
 

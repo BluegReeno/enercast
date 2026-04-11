@@ -85,7 +85,7 @@ def main() -> None:
 
     settings = get_settings()
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-    client = mlflow.tracking.MlflowClient()  # pyright: ignore[reportPrivateImportUsage]
+    client = mlflow.MlflowClient()
 
     if args.experiment:
         experiment_names = args.experiment

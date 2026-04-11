@@ -31,7 +31,7 @@ def test_log_lineage_tags_sets_tags(tmp_path):
             change_reason="test_run",
         )
 
-    client = mlflow.tracking.MlflowClient()  # pyright: ignore[reportPrivateImportUsage]
+    client = mlflow.MlflowClient()
     run_data = client.get_run(run.info.run_id)
     tags = run_data.data.tags
 
@@ -52,7 +52,7 @@ def test_log_lineage_tags_optional_fields(tmp_path):
     with mlflow.start_run() as run:
         log_lineage_tags()  # all defaults
 
-    client = mlflow.tracking.MlflowClient()  # pyright: ignore[reportPrivateImportUsage]
+    client = mlflow.MlflowClient()
     run_data = client.get_run(run.info.run_id)
     tags = run_data.data.tags
 

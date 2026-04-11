@@ -98,7 +98,7 @@ def test_run_training_with_model_logging(_wind_features_parquet, tmp_path):
     )
     assert len(runs) == 1
     # Verify model was logged via MLflow 3.x LoggedModel API
-    client = mlflow.tracking.MlflowClient()
+    client = mlflow.MlflowClient()
     exp = client.get_experiment_by_name("test-registry")
     assert exp is not None
     logged_models = client.search_logged_models(
@@ -134,7 +134,7 @@ def test_run_training_logs_horizon_router(_wind_features_parquet, tmp_path):
         )
 
     mlflow.set_tracking_uri(tracking_uri)
-    client = mlflow.tracking.MlflowClient()
+    client = mlflow.MlflowClient()
     # Find the parent run
     runs = mlflow.search_runs(
         experiment_names=["test-router-log"],
@@ -181,7 +181,7 @@ def test_promote_model_from_existing_run(_wind_features_parquet, tmp_path):
         )
 
     mlflow.set_tracking_uri(tracking_uri)
-    client = mlflow.tracking.MlflowClient()
+    client = mlflow.MlflowClient()
 
     # Find the parent run
     runs = mlflow.search_runs(

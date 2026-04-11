@@ -476,7 +476,7 @@ def run_training(
 
         active = mlflow.active_run()
         parent_run_id = active.info.run_id if active else ""
-        client = mlflow.tracking.MlflowClient()  # pyright: ignore[reportPrivateImportUsage]
+        client = mlflow.MlflowClient()
         exp_obj = client.get_experiment_by_name(experiment_name)
         if exp_obj and parent_run_id:
             children = client.search_runs(

@@ -90,7 +90,7 @@ def _solar_regime_analysis(
 
 def _load_models_from_run(run_id: str) -> dict[int, xgb.XGBRegressor]:
     """Load trained models from an MLflow run's child runs."""
-    client = mlflow.tracking.MlflowClient()
+    client = mlflow.MlflowClient()
     parent_run = client.get_run(run_id)
 
     # Find child runs
@@ -114,7 +114,7 @@ def _load_models_from_run(run_id: str) -> dict[int, xgb.XGBRegressor]:
 
 def _find_latest_run(experiment_name: str) -> str | None:
     """Find the latest parent run ID for an experiment."""
-    client = mlflow.tracking.MlflowClient()
+    client = mlflow.MlflowClient()
     experiment = client.get_experiment_by_name(experiment_name)
     if experiment is None:
         return None

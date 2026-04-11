@@ -92,7 +92,7 @@ def find_best_run(experiment_name: str, metric: str) -> str:
 
 def promote_run(run_id: str, model_name: str, alias: str = "champion") -> None:
     """Register the HorizonRouter from a run and set the alias."""
-    client = mlflow.tracking.MlflowClient()  # pyright: ignore[reportPrivateImportUsage]
+    client = mlflow.MlflowClient()
 
     # Verify the run exists
     try:
@@ -112,8 +112,7 @@ def promote_run(run_id: str, model_name: str, alias: str = "champion") -> None:
     )
     if not logged_models:
         logger.error(
-            "Run '%s' has no 'horizon_router' model. "
-            "Was it trained with log_models=True?",
+            "Run '%s' has no 'horizon_router' model. Was it trained with log_models=True?",
             run_id[:8],
         )
         sys.exit(1)
@@ -195,7 +194,7 @@ def main() -> None:
         model_name = args.model_name
     else:
         # Infer from run tags
-        client = mlflow.tracking.MlflowClient()  # pyright: ignore[reportPrivateImportUsage]
+        client = mlflow.MlflowClient()
         run = client.get_run(run_id)
         dataset = run.data.params.get("dataset", "unknown")
         backend = run.data.tags.get("enercast.backend", "xgboost")

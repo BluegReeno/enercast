@@ -53,6 +53,13 @@ class HorizonRouter(mlflow.pyfunc.PythonModel):  # pyright: ignore[reportPrivate
             raise ValueError(
                 f"No model for horizon {horizon}. Available: {sorted(self.models.keys())}"
             )
+        # Align dtypes with sub-model signature — the router's outer schema
+        # declares all inputs as double, but sub-models may expect integer
+        # for boolean-like columns (e.g. is_holiday).
+        if hasattr(model, "metadata") and model.metadata.signature:
+            for col_spec in model.metadata.signature.inputs:
+                if col_spec.name in model_input.columns and col_spec.type == DataType.integer:
+                    model_input[col_spec.name] = model_input[col_spec.name].astype("int32")
         result = model.predict(model_input)
         if isinstance(result, np.ndarray):
             return result
