@@ -321,3 +321,64 @@ class TestOutputFormat:
         assert build_horizon_desc(24, 10) == "4h ahead"
         assert build_horizon_desc(24, 60) == "D+1"
         assert build_horizon_desc(3, 10) == "30 min ahead"
+
+
+# ---------------------------------------------------------------------------
+# Predict functions — params routing
+# ---------------------------------------------------------------------------
+
+
+class TestPredictWithParams:
+    """Tests for _predict_server and _predict_direct with horizon params."""
+
+    def test_predict_server_includes_params(self):
+        """Verify _predict_server sends params.horizon in the payload."""
+        from unittest.mock import patch
+
+        from scripts.inference import _predict_server
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"predictions": [1234.5]}
+        mock_response.raise_for_status = MagicMock()
+
+        X = pl.DataFrame({"wind_speed_ms": [8.5], "temp": [15.0]})
+
+        with patch("requests.post", return_value=mock_response) as mock_post:
+            result = _predict_server("http://localhost:5001", X, horizon=24)
+
+        assert result == 1234.5
+        # Verify the payload includes params
+        call_kwargs = mock_post.call_args
+        payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+        assert "params" in payload
+        assert payload["params"]["horizon"] == 24
+        assert "dataframe_split" in payload
+
+    def test_predict_direct_passes_params(self):
+        """Verify _predict_direct passes params={"horizon": h} to the model."""
+        from scripts.inference import _predict_direct
+
+        mock_model = MagicMock()
+        mock_model.predict.return_value = np.array([567.8])
+
+        X = pl.DataFrame({"wind_speed_ms": [8.5]})
+        result = _predict_direct(mock_model, X, horizon=12)
+
+        assert result == 567.8
+        # Verify params was passed
+        call_args = mock_model.predict.call_args
+        assert call_args.kwargs.get("params") == {"horizon": 12}
+
+    def test_predict_direct_single_call(self):
+        """Verify _predict_direct makes exactly one predict call with params."""
+        from scripts.inference import _predict_direct
+
+        mock_model = MagicMock()
+        mock_model.predict.return_value = np.array([999.0])
+
+        X = pl.DataFrame({"wind_speed_ms": [8.5]})
+        result = _predict_direct(mock_model, X, horizon=6)
+
+        assert result == 999.0
+        assert mock_model.predict.call_count == 1
+        assert mock_model.predict.call_args.kwargs["params"] == {"horizon": 6}

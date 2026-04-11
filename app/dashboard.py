@@ -10,13 +10,16 @@ Usage:
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import mlflow
 import pandas as pd
 import plotly.graph_objects as go
 import polars as pl
+import requests
 import streamlit as st
 
 # Add project root to path so `scripts.inference` is importable
@@ -33,10 +36,15 @@ EXPERIMENTS_BY_DOMAIN: dict[str, str] = {
     "wind": "enercast-kelmarsh",
     "demand": "enercast-rte_france",
 }
+MODEL_NAME_BY_DOMAIN: dict[str, str] = {
+    "wind": "enercast-kelmarsh-xgboost",
+    "demand": "enercast-rte_france-xgboost",
+}
 DOMAIN_DEFAULTS: dict[str, str] = {"wind": "kelmarsh", "demand": "rte_france"}
 UNIT_BY_DOMAIN: dict[str, str] = {"wind": "kW", "demand": "MW"}
 WEATHER_CONFIG_MAP: dict[str, str] = {"kelmarsh": "kelmarsh", "rte_france": "rte_france"}
 DEFAULT_HORIZONS: list[int] = [1, 6, 12, 24, 48]
+SERVE_URL: str | None = os.environ.get("ENERCAST_SERVE_URL")
 
 # ---------------------------------------------------------------------------
 # Page config — MUST be the first Streamlit call
@@ -68,6 +76,19 @@ def load_parent_runs(experiment_name: str):
 
 
 @st.cache_resource
+def load_champion_model(model_name: str) -> Any:
+    """Load the champion HorizonRouter model from the registry — cached."""
+    from mlflow.exceptions import MlflowException
+
+    settings = get_settings()
+    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+    try:
+        return mlflow.pyfunc.load_model(f"models:/{model_name}@champion")
+    except MlflowException:
+        return None
+
+
+@st.cache_resource
 def load_models_for_run(parent_run_id: str) -> dict[int, object]:
     """Load all horizon models from a parent run's children — cached as singleton."""
     settings = get_settings()
@@ -91,6 +112,25 @@ def load_models_for_run(parent_run_id: str) -> dict[int, object]:
     return models
 
 
+def predict_via_server(serve_url: str, X_pd: pd.DataFrame, horizon: int) -> float:
+    """POST to MLflow serving endpoint with params routing."""
+    payload = {
+        "dataframe_split": {
+            "columns": X_pd.columns.tolist(),
+            "data": X_pd.values.tolist(),
+        },
+        "params": {"horizon": horizon},
+    }
+    resp = requests.post(f"{serve_url.rstrip('/')}/invocations", json=payload)
+    resp.raise_for_status()
+    result = resp.json()
+    if isinstance(result, dict) and "predictions" in result:
+        return float(result["predictions"][0])
+    if isinstance(result, list):
+        return float(result[0])
+    return float(result)
+
+
 # ---------------------------------------------------------------------------
 # Forecast runner
 # ---------------------------------------------------------------------------
@@ -99,10 +139,20 @@ def load_models_for_run(parent_run_id: str) -> dict[int, object]:
 def run_forecast(
     domain: str,
     dataset: str,
-    models: dict[int, object],
     feature_set: str,
+    *,
+    router: Any | None = None,
+    models: dict[int, Any] | None = None,
+    horizons: list[int] | None = None,
+    serve_url: str | None = None,
 ) -> list[dict]:
-    """Run inference across all loaded horizons. Returns list of result dicts."""
+    """Run inference across all horizons. Returns list of result dicts.
+
+    Three modes:
+    - **serve_url**: POST to MLflow serving endpoint (HorizonRouter via REST)
+    - **router**: in-process HorizonRouter, route via params={"horizon": h}
+    - **models**: legacy per-horizon dict, one model per horizon
+    """
     from scripts.inference import build_inference_features
     from windcast.weather import get_live_forecast
 
@@ -126,10 +176,16 @@ def run_forecast(
     # Fetch live NWP
     nwp = get_live_forecast(weather_name, forecast_days=3, past_days=2)
 
-    results = []
-    for h in sorted(models):
-        model = models[h]
+    # Determine which horizons to iterate
+    if models is not None:
+        iter_horizons = sorted(models.keys())
+    elif horizons is not None:
+        iter_horizons = horizons
+    else:
+        iter_horizons = DEFAULT_HORIZONS
 
+    results = []
+    for h in iter_horizons:
         features = build_inference_features(
             actuals_df=actuals,
             nwp_df=nwp,
@@ -139,7 +195,16 @@ def run_forecast(
             resolution_minutes=resolution,
         )
 
-        prediction = float(model.predict(features.to_pandas())[0])
+        features_pd = features.to_pandas()
+
+        if serve_url:
+            prediction = predict_via_server(serve_url, features_pd, h)
+        elif router is not None:
+            prediction = float(router.predict(features_pd, params={"horizon": h})[0])
+        elif models is not None and h in models:
+            prediction = float(models[h].predict(features_pd)[0])
+        else:
+            continue
 
         offset_minutes = h * resolution
         target_ts = last_ts + dt.timedelta(minutes=offset_minutes)
@@ -213,34 +278,55 @@ with st.sidebar:
     dataset = DOMAIN_DEFAULTS[domain]
     experiment = EXPERIMENTS_BY_DOMAIN[domain]
     unit = UNIT_BY_DOMAIN[domain]
+    model_name = MODEL_NAME_BY_DOMAIN[domain]
 
-    # Load runs for this experiment
-    runs_df = load_parent_runs(experiment)
+    # Mode selector
+    mode = st.radio("Model source", ["Champion", "Run"], horizontal=True)
 
-    if runs_df.empty:
-        st.error(f"No trained models found in experiment '{experiment}'")
-        st.stop()
+    router_model: Any = None
+    run_models: dict[int, Any] | None = None
+    feature_set = f"{domain}_full"
+    runs_df: Any = pd.DataFrame()
+    selected_name: str | None = None
 
-    # Model run selector
-    name_col = "tags.mlflow.runName"
-    run_names = runs_df[name_col].dropna().tolist()
-    selected_name = st.selectbox("Model run", run_names)
+    if mode == "Champion":
+        router_model = load_champion_model(model_name)
+        if router_model is None:
+            st.warning(f"No champion model registered as '{model_name}'. Falling back to run mode.")
+            mode = "Run"
+        else:
+            st.caption(f"**Model:** `{model_name}@champion`")
+            if SERVE_URL:
+                st.caption(f"**Serve URL:** `{SERVE_URL}`")
 
-    # Get selected run row
-    selected_run = runs_df[runs_df[name_col] == selected_name].iloc[0]
-    run_id = selected_run["run_id"]
+    if mode == "Run":
+        # Load runs for this experiment
+        runs_df = load_parent_runs(experiment)
 
-    # Feature set (from run tags)
-    feature_set = selected_run.get("tags.enercast.feature_set", f"{domain}_full")
+        if runs_df.empty:
+            st.error(f"No trained models found in experiment '{experiment}'")
+            st.stop()
 
-    # Pre-load all horizon models for this run
-    models = load_models_for_run(run_id)
+        # Model run selector
+        name_col = "tags.mlflow.runName"
+        run_names = runs_df[name_col].dropna().tolist()
+        selected_name = st.selectbox("Model run", run_names)
 
-    if not models:
-        st.error(f"No horizon models found for run '{selected_name}'")
-        st.stop()
+        # Get selected run row
+        selected_run = runs_df[runs_df[name_col] == selected_name].iloc[0]
+        run_id = selected_run["run_id"]
 
-    st.caption(f"**Horizons loaded:** {', '.join(f'h{h}' for h in sorted(models))}")
+        # Feature set (from run tags)
+        feature_set = selected_run.get("tags.enercast.feature_set", f"{domain}_full")
+
+        # Pre-load all horizon models for this run
+        run_models = load_models_for_run(run_id)
+
+        if not run_models:
+            st.error(f"No horizon models found for run '{selected_name}'")
+            st.stop()
+
+        st.caption(f"**Horizons loaded:** {', '.join(f'h{h}' for h in sorted(run_models))}")
 
     # Generate button
     run_btn = st.button("Generate Forecast", type="primary", use_container_width=True)
@@ -248,20 +334,25 @@ with st.sidebar:
     # Model metadata
     st.divider()
     st.subheader("Model Info")
-    backend = selected_run.get("tags.enercast.backend", "—")
-    st.caption(f"**Backend:** {backend}")
-    st.caption(f"**Feature set:** {feature_set}")
-    trained_date = selected_run["start_time"]
-    if hasattr(trained_date, "strftime"):
-        st.caption(f"**Trained:** {trained_date.strftime('%Y-%m-%d %H:%M')}")
+    if mode == "Run" and not runs_df.empty and selected_name:
+        selected_run = runs_df[runs_df["tags.mlflow.runName"] == selected_name].iloc[0]
+        backend_tag = selected_run.get("tags.enercast.backend", "—")
+        st.caption(f"**Backend:** {backend_tag}")
+        st.caption(f"**Feature set:** {feature_set}")
+        trained_date = selected_run["start_time"]
+        if hasattr(trained_date, "strftime"):
+            st.caption(f"**Trained:** {trained_date.strftime('%Y-%m-%d %H:%M')}")
 
-    # Show validation MAE per horizon if available
-    for h in DEFAULT_HORIZONS:
-        mae_col = f"metrics.h{h}_mae"
-        if mae_col in runs_df.columns:
-            mae_val = selected_run.get(mae_col)
-            if pd.notna(mae_val):
-                st.caption(f"Val MAE h{h}: **{mae_val:,.0f} {unit}**")
+        # Show validation MAE per horizon if available
+        for h in DEFAULT_HORIZONS:
+            mae_col = f"metrics.h{h}_mae"
+            if mae_col in runs_df.columns:
+                mae_val = selected_run.get(mae_col)
+                if pd.notna(mae_val):
+                    st.caption(f"Val MAE h{h}: **{mae_val:,.0f} {unit}**")
+    else:
+        st.caption(f"**Feature set:** {feature_set}")
+        st.caption("**Mode:** Champion (registry)")
 
 # ---------------------------------------------------------------------------
 # Main area
@@ -276,8 +367,10 @@ if run_btn:
             results = run_forecast(
                 domain=domain,
                 dataset=dataset,
-                models=models,
                 feature_set=feature_set,
+                router=router_model,
+                models=run_models,
+                serve_url=SERVE_URL if mode == "Champion" else None,
             )
             st.session_state["forecast_results"] = results
             st.session_state["forecast_domain"] = domain

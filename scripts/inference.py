@@ -124,15 +124,19 @@ def _load_model_direct(model_uri: str) -> Any:
     return mlflow.pyfunc.load_model(model_uri)
 
 
-def _predict_direct(model: Any, X: pl.DataFrame) -> float:
-    """Run prediction via direct model loading."""
+def _predict_direct(model: Any, X: pl.DataFrame, horizon: int) -> float:
+    """Run prediction via direct model loading.
+
+    Passes params={"horizon": h} — HorizonRouter routes to the right sub-model,
+    and single-horizon models silently ignore unknown params (MLflow pyfunc behavior).
+    """
     X_pd = X.to_pandas()
-    predictions = model.predict(X_pd)
+    predictions = model.predict(X_pd, params={"horizon": horizon})
     return float(predictions[0])
 
 
-def _predict_server(serve_url: str, X: pl.DataFrame) -> float:
-    """Run prediction via MLflow serving endpoint."""
+def _predict_server(serve_url: str, X: pl.DataFrame, horizon: int) -> float:
+    """Run prediction via MLflow serving endpoint with params routing."""
     import requests
 
     X_pd = X.to_pandas()
@@ -140,7 +144,8 @@ def _predict_server(serve_url: str, X: pl.DataFrame) -> float:
         "dataframe_split": {
             "columns": X_pd.columns.tolist(),
             "data": X_pd.values.tolist(),
-        }
+        },
+        "params": {"horizon": horizon},
     }
 
     url = f"{serve_url.rstrip('/')}/invocations"
@@ -296,10 +301,10 @@ def main() -> None:
 
     # 5. Predict
     if args.serve_url:
-        prediction = _predict_server(args.serve_url, X)
+        prediction = _predict_server(args.serve_url, X, args.horizon)
     else:
         assert model is not None, "No model loaded and no --serve-url provided"
-        prediction = _predict_direct(model, X)
+        prediction = _predict_direct(model, X, args.horizon)
 
     # 6. Format output
     horizon_desc = build_horizon_desc(args.horizon, resolution_minutes)

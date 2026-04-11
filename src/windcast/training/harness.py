@@ -303,8 +303,9 @@ def run_training(
 
         results_summary: list[str] = []
         horizon_metrics: dict[int, dict[str, float]] = {}
-        best_model_uri: str | None = None
         best_mae: float = float("inf")
+        horizon_model_uris: dict[int, str] = {}
+        last_feature_cols: list[str] = []
 
         for h in horizons:
             logger.info("=== Horizon h=%d (%s) ===", h, horizon_descs[h])
@@ -401,11 +402,13 @@ def run_training(
                 model_uri = None
                 if log_models:
                     model_uri = backend.log_model(model, X_val, y_pred, h)
+                if model_uri:
+                    horizon_model_uris[h] = model_uri
+                last_feature_cols = list(X_val.columns)
 
                 mae = metrics["mae"]
-                if model_uri and mae < best_mae:
+                if mae < best_mae:
                     best_mae = mae
-                    best_model_uri = model_uri
                 rmse = metrics["rmse"]
                 skill = metrics.get("skill_score", float("nan"))
                 bias = metrics.get("bias", float("nan"))
@@ -486,13 +489,28 @@ def run_training(
                     if k.startswith("h") and ("_mae" in k or "_rmse" in k or "_skill_score" in k):
                         mlflow.log_metric(k, v)
 
-        if register_model_name and log_models and best_model_uri:
-            mv = mlflow.register_model(best_model_uri, register_model_name)
+        # horizon_model_uris non-empty guarantees last_feature_cols is also non-empty
+        if register_model_name and log_models and horizon_model_uris:
+            from windcast.models.horizon_router import HorizonRouter, build_router_signature
+
+            router = HorizonRouter(horizon_model_uris)
+            router.load_context(None)
+
+            signature = build_router_signature(last_feature_cols, default_horizon=horizons[0])
+
+            router_info = mlflow.pyfunc.log_model(
+                name="horizon_router",
+                python_model=router,
+                signature=signature,
+            )
+
+            mv = mlflow.register_model(router_info.model_uri, register_model_name)
             client.set_registered_model_alias(register_model_name, "champion", str(mv.version))
             logger.info(
-                "Registered model %s version %s (MAE=%.1f)",
+                "Registered %s v%s @champion (%d horizons, best MAE=%.1f)",
                 register_model_name,
                 mv.version,
+                len(horizon_model_uris),
                 best_mae,
             )
 

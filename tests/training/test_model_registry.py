@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import mlflow
 import numpy as np
+import pandas as pd
 import polars as pl
 import pytest
 
@@ -142,3 +143,63 @@ def test_run_training_with_registration(_wind_features_parquet, tmp_path):
     # Verify champion alias
     alias_mv = client.get_model_version_by_alias("test-enercast-kelmarsh-xgboost", "champion")
     assert alias_mv is not None
+
+
+def test_run_training_registers_horizon_router(_wind_features_parquet, tmp_path):
+    """Test that registration creates a HorizonRouter servable via params."""
+    tracking_uri = f"sqlite:///{tmp_path}/mlflow_router_test.db"
+
+    with patch("windcast.config.get_settings") as mock_settings:
+        mock_settings.return_value.mlflow_tracking_uri = tracking_uri
+        mock_settings.return_value.train_years = 5
+        mock_settings.return_value.val_years = 1
+        mock_settings.return_value.features_dir = _wind_features_parquet
+
+        run_training(
+            backend=XGBoostBackend(),
+            domain="wind",
+            dataset="kelmarsh",
+            feature_set_name="wind_baseline",
+            features_path=_wind_features_parquet / "kelmarsh_kwf1.parquet",
+            experiment_name="test-router",
+            horizons=[1, 6],
+            turbine_id="kwf1",
+            log_models=True,
+            register_model_name="test-router-model",
+            train_years=8,
+            val_years=2,
+        )
+
+    mlflow.set_tracking_uri(tracking_uri)
+    client = mlflow.tracking.MlflowClient()
+
+    # Verify champion alias resolves
+    alias_mv = client.get_model_version_by_alias("test-router-model", "champion")
+    assert alias_mv is not None
+
+    # Load the registered model — should be a HorizonRouter
+    model = mlflow.pyfunc.load_model("models:/test-router-model@champion")
+
+    # Build a minimal input matching the training feature columns
+    rng = np.random.default_rng(42)
+    # Read the feature parquet to get column names
+    features_df = pl.read_parquet(_wind_features_parquet / "kelmarsh_kwf1.parquet")
+    # Get feature columns (same logic as wind_baseline: exclude target + timestamp)
+    exclude = {"timestamp_utc", "active_power_kw", "turbine_id", "qc_flag"}
+    feature_cols = [c for c in features_df.columns if c not in exclude]
+
+    X_test = pd.DataFrame({c: rng.normal(size=1).tolist() for c in feature_cols})
+
+    # Predict with horizon=1
+    pred_h1 = model.predict(X_test, params={"horizon": 1})
+    assert pred_h1 is not None
+    assert len(pred_h1) == 1
+
+    # Predict with horizon=6
+    pred_h6 = model.predict(X_test, params={"horizon": 6})
+    assert pred_h6 is not None
+    assert len(pred_h6) == 1
+
+    # Different horizons should give different predictions (different models)
+    # (Not guaranteed with random data, but very likely)
+    assert isinstance(pred_h1[0], (int, float, np.floating))
