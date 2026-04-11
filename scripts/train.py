@@ -102,23 +102,12 @@ def main() -> None:
         help="Data quality: CLEAN or LEAKED. Default: CLEAN",
     )
     parser.add_argument("--change-reason", default=None, help="Free-text change reason")
-    # Model logging & registry
+    # Model logging
     parser.add_argument(
         "--no-log-models",
         action="store_true",
         default=False,
         help="Skip logging model artifacts to MLflow (faster for experimentation)",
-    )
-    parser.add_argument(
-        "--register",
-        action="store_true",
-        default=False,
-        help="Register best model to MLflow Model Registry",
-    )
-    parser.add_argument(
-        "--model-name",
-        default=None,
-        help="Registered model name. Default: enercast-{dataset}-{backend}",
     )
     args = parser.parse_args()
 
@@ -175,8 +164,6 @@ def main() -> None:
     else:
         backend = XGBoostBackend()
 
-    model_name = args.model_name or f"enercast-{dataset}-{args.backend}"
-
     run_training(
         backend=backend,
         domain=domain,
@@ -193,7 +180,6 @@ def main() -> None:
         train_years=resolved_train_years,
         val_years=resolved_val_years,
         log_models=not args.no_log_models,
-        register_model_name=model_name if args.register else None,
     )
 
 

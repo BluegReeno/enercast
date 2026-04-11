@@ -43,6 +43,9 @@ uv run python scripts/train.py --domain demand --dataset rte_france --train-year
 # Compare runs (MAE + Skill bar charts)
 uv run python scripts/compare_runs.py --experiment enercast-kelmarsh
 
+# Promote best model to champion (after evaluating in MLflow UI)
+uv run python scripts/promote_model.py --experiment enercast-kelmarsh --metric h24_mae
+
 # View results
 mlflow ui
 ```

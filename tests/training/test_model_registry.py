@@ -109,8 +109,8 @@ def test_run_training_with_model_logging(_wind_features_parquet, tmp_path):
     assert "model_h01" in model_names
 
 
-def test_run_training_with_registration(_wind_features_parquet, tmp_path):
-    """Test run_training registers best model when register_model_name is set."""
+def test_run_training_logs_horizon_router(_wind_features_parquet, tmp_path):
+    """Test run_training always logs HorizonRouter artifact when log_models=True."""
     tracking_uri = f"sqlite:///{tmp_path}/mlflow_register_test.db"
 
     with patch("windcast.config.get_settings") as mock_settings:
@@ -125,28 +125,39 @@ def test_run_training_with_registration(_wind_features_parquet, tmp_path):
             dataset="kelmarsh",
             feature_set_name="wind_baseline",
             features_path=_wind_features_parquet / "kelmarsh_kwf1.parquet",
-            experiment_name="test-register",
+            experiment_name="test-router-log",
             horizons=[1],
             turbine_id="kwf1",
             log_models=True,
-            register_model_name="test-enercast-kelmarsh-xgboost",
             train_years=8,
             val_years=2,
         )
 
     mlflow.set_tracking_uri(tracking_uri)
     client = mlflow.tracking.MlflowClient()
-    # Verify model was registered
-    registered = client.get_registered_model("test-enercast-kelmarsh-xgboost")
-    assert registered is not None
-    assert len(registered.latest_versions) >= 1
-    # Verify champion alias
-    alias_mv = client.get_model_version_by_alias("test-enercast-kelmarsh-xgboost", "champion")
-    assert alias_mv is not None
+    # Find the parent run
+    runs = mlflow.search_runs(
+        experiment_names=["test-router-log"],
+        filter_string="tags.`enercast.run_type` = 'parent'",
+        output_format="pandas",
+    )
+    assert len(runs) == 1
+    parent_run_id = runs.iloc[0]["run_id"]
+
+    # Verify horizon_router LoggedModel exists on parent run (MLflow 3.x)
+    exp = client.get_experiment_by_name("test-router-log")
+    assert exp is not None
+    logged_models = client.search_logged_models(
+        experiment_ids=[exp.experiment_id],
+        filter_string=f"source_run_id = '{parent_run_id}' AND name = 'horizon_router'",
+    )
+    assert len(logged_models) >= 1
 
 
-def test_run_training_registers_horizon_router(_wind_features_parquet, tmp_path):
-    """Test that registration creates a HorizonRouter servable via params."""
+def test_promote_model_from_existing_run(_wind_features_parquet, tmp_path):
+    """Test the full workflow: train → promote → load champion → predict."""
+    from scripts.promote_model import promote_run
+
     tracking_uri = f"sqlite:///{tmp_path}/mlflow_router_test.db"
 
     with patch("windcast.config.get_settings") as mock_settings:
@@ -161,11 +172,10 @@ def test_run_training_registers_horizon_router(_wind_features_parquet, tmp_path)
             dataset="kelmarsh",
             feature_set_name="wind_baseline",
             features_path=_wind_features_parquet / "kelmarsh_kwf1.parquet",
-            experiment_name="test-router",
+            experiment_name="test-promote",
             horizons=[1, 6],
             turbine_id="kwf1",
             log_models=True,
-            register_model_name="test-router-model",
             train_years=8,
             val_years=2,
         )
@@ -173,18 +183,28 @@ def test_run_training_registers_horizon_router(_wind_features_parquet, tmp_path)
     mlflow.set_tracking_uri(tracking_uri)
     client = mlflow.tracking.MlflowClient()
 
+    # Find the parent run
+    runs = mlflow.search_runs(
+        experiment_names=["test-promote"],
+        filter_string="tags.`enercast.run_type` = 'parent'",
+        output_format="pandas",
+    )
+    assert len(runs) == 1
+    parent_run_id = runs.iloc[0]["run_id"]
+
+    # Promote using the standalone function
+    promote_run(parent_run_id, "test-promote-model", alias="champion")
+
     # Verify champion alias resolves
-    alias_mv = client.get_model_version_by_alias("test-router-model", "champion")
+    alias_mv = client.get_model_version_by_alias("test-promote-model", "champion")
     assert alias_mv is not None
 
     # Load the registered model — should be a HorizonRouter
-    model = mlflow.pyfunc.load_model("models:/test-router-model@champion")
+    model = mlflow.pyfunc.load_model("models:/test-promote-model@champion")
 
     # Build a minimal input matching the training feature columns
     rng = np.random.default_rng(42)
-    # Read the feature parquet to get column names
     features_df = pl.read_parquet(_wind_features_parquet / "kelmarsh_kwf1.parquet")
-    # Get feature columns (same logic as wind_baseline: exclude target + timestamp)
     exclude = {"timestamp_utc", "active_power_kw", "turbine_id", "qc_flag"}
     feature_cols = [c for c in features_df.columns if c not in exclude]
 
@@ -200,6 +220,4 @@ def test_run_training_registers_horizon_router(_wind_features_parquet, tmp_path)
     assert pred_h6 is not None
     assert len(pred_h6) == 1
 
-    # Different horizons should give different predictions (different models)
-    # (Not guaranteed with random data, but very likely)
     assert isinstance(pred_h1[0], (int, float, np.floating))

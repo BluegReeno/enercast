@@ -177,7 +177,6 @@ def run_training(
     train_years: int | None = None,
     val_years: int | None = None,
     log_models: bool = True,
-    register_model_name: str | None = None,
 ) -> None:
     """Run the full training pipeline for any backend.
 
@@ -489,8 +488,8 @@ def run_training(
                     if k.startswith("h") and ("_mae" in k or "_rmse" in k or "_skill_score" in k):
                         mlflow.log_metric(k, v)
 
-        # horizon_model_uris non-empty guarantees last_feature_cols is also non-empty
-        if register_model_name and log_models and horizon_model_uris:
+        # Log HorizonRouter as parent-run artifact (bundles all horizon sub-models)
+        if log_models and horizon_model_uris:
             from windcast.models.horizon_router import HorizonRouter, build_router_signature
 
             router = HorizonRouter(horizon_model_uris)
@@ -498,18 +497,13 @@ def run_training(
 
             signature = build_router_signature(last_feature_cols, default_horizon=horizons[0])
 
-            router_info = mlflow.pyfunc.log_model(
+            mlflow.pyfunc.log_model(
                 name="horizon_router",
                 python_model=router,
                 signature=signature,
             )
-
-            mv = mlflow.register_model(router_info.model_uri, register_model_name)
-            client.set_registered_model_alias(register_model_name, "champion", str(mv.version))
             logger.info(
-                "Registered %s v%s @champion (%d horizons, best MAE=%.1f)",
-                register_model_name,
-                mv.version,
+                "Logged HorizonRouter artifact (%d horizons, best MAE=%.1f)",
                 len(horizon_model_uris),
                 best_mae,
             )
