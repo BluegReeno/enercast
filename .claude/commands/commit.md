@@ -58,7 +58,18 @@ obvious from the diff.]
 [Optional: Fixes #123, Closes #456]
 ```
 
-### 4. Capture AI Context Changes
+### 4. Update STATUS.md
+
+Before committing, update `.claude/STATUS.md` to reflect the work done:
+
+- If a feature or improvement was completed, add/update the corresponding `[x]` entry
+- If a task file in `.claude/tasks/` was completed, ensure STATUS.md reflects it
+- Update the `Last Updated` date at the top if substantive changes were made
+- Keep entries concise (one line per item, same style as existing entries)
+
+**Always stage STATUS.md with the commit** so project state stays in sync with the code.
+
+### 5. Capture AI Context Changes
 
 If any AI context assets were modified in this commit, add a `Context:` section to the commit body:
 
