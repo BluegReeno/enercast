@@ -603,8 +603,12 @@ if run_btn:
                 logger.exception("Forecast failed")
                 st.session_state.pop("forecast_results", None)
 
+# Drop stale demand state when the user switches to a non-demand domain
+if domain != "demand":
+    st.session_state.pop("demand_timeline", None)
+
 # Display demand timeline
-if "demand_timeline" in st.session_state:
+if domain == "demand" and "demand_timeline" in st.session_state:
     tl = st.session_state["demand_timeline"]
     dh = display_horizon  # read live from sidebar dropdown — updates on every rerun
 
