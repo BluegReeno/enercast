@@ -56,3 +56,8 @@ reports/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Claude internal files (contain project-specific context)
+.claude/STATUS.md
+.claude/plans/
+.claude/docs/
