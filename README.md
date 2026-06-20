@@ -132,7 +132,7 @@ Python 3.12+ · uv · Polars · XGBoost · AutoGluon-Tabular · LightGBM · mlfo
 | Benchmark | Metric | Score | vs. Baseline |
 |-----------|--------|-------|--------------|
 | RTE France national load (11 years) | MAE h24 | 1,139 MW | **−5.5% vs. RTE TSO day-ahead** |
-| Kelmarsh wind (6 turbines, XGBoost full) | MAE h24 | 231 kW | **skill 0.315 vs. 0.107 persistence** |
+| Kelmarsh wind (6 turbines, XGBoost full) | MAE h24 | 231 kW | **skill 0.315 vs. 0.107 XGB baseline** |
 
 ## Documentation
 

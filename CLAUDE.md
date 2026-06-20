@@ -52,21 +52,19 @@ Example: `.claude/rules/frontend.md` loads when editing `src/frontend/**/*.tsx`.
 | Location | When to read |
 |----------|--------------|
 | `.claude/reference/` | Manually, for reusable patterns and code examples |
-| `.claude/docs/` | Via sub-agents, for heavy guides (100+ lines) |
 
 ### Always-Available Documents
 
 | Document | When to Read |
 |----------|--------------|
 | `.claude/PRD.md` | Project scope, features, architecture |
-| `.claude/STATUS.md` | Current sprint, priorities, next actions |
 
 ---
 
 ## Task Management
 
 **Workflow:**
-1. Check `STATUS.md` for current focus
+1. Check `.claude/tasks/` for the active task
 2. Read active task file in `.claude/tasks/`
 3. Mark `@claude` when starting, `[x] ✓ YYYY-MM-DD` when done
 4. Move completed features to `_archive/`
@@ -164,6 +162,6 @@ uv run pytest tests/ -v                    # Tests
 
 ## External Resources
 
-- [PRD](.claude/PRD.md) | [Status](.claude/STATUS.md) | [README](README.md)
+- [PRD](.claude/PRD.md) | [README](README.md)
 - [Brainstorming](docs/research/brainstorming-2026-03-31.md) | [Methodology](docs/research/methodology-scaling-pipeline.md)
 - [Dataset Catalog](docs/research/datasets-catalog-2026-03-31.md)
