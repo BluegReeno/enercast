@@ -127,10 +127,16 @@ Python 3.12+ · uv · Polars · XGBoost · AutoGluon-Tabular · LightGBM · mlfo
 - pyright type checking clean
 - Strict temporal train/val/test splits (no data leakage)
 
+## Results
+
+| Benchmark | Metric | Score | vs. Baseline |
+|-----------|--------|-------|--------------|
+| RTE France national load (11 years) | MAE h24 | 1,139 MW | **−5.5% vs. RTE TSO day-ahead** |
+| Kelmarsh wind (6 turbines, XGBoost full) | MAE h24 | 231 kW | **skill 0.315 vs. 0.107 persistence** |
+
 ## Documentation
 
 - **[PRD](.claude/PRD.md)** — Product requirements and architecture
-- **[Status](.claude/STATUS.md)** — Current sprint and priorities
 - **[Research](docs/research/)** — Dataset catalog, methodology, brainstorming
 
 ## License
