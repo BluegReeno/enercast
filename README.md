@@ -1,5 +1,7 @@
 # EnerCast
 
+[![CI](https://github.com/BluegReeno/enercast/actions/workflows/ci.yml/badge.svg)](https://github.com/BluegReeno/enercast/actions/workflows/ci.yml)
+
 **The plumbing layer for energy forecasting ML.** Handles data ingestion, QC, schemas, experiment tracking, and evaluation — so domain experts spend their time on what actually improves accuracy: feature engineering, model selection, and understanding client data.
 
 Every hour an engineer spends writing QC scripts, debugging deployment artifacts, or rebuilding data pipelines is an hour NOT spent on accuracy. EnerCast solves the plumbing once. Engineers iterate on features, models, and KPIs — not on boilerplate.
